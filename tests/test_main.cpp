@@ -285,6 +285,52 @@ static void testEngine() {
     eng->shutdown();
 }
 
+
+static void testLoop() {
+    // One stem holding a ramp (sample i = i * 1e-6): the master must equal the ramp read through the loop map.
+    const double sr = 48000; const std::uint32_t blk = 256;
+    const std::size_t len = 40000;
+    std::vector<float> ramp(len);
+    for (std::size_t i = 0; i < len; ++i) ramp[i] = float(i) * 1e-6f;
+    struct Case { std::uint64_t a, b; const char* name; };
+    for (Case c : {Case{1000, 5000, "Loop 1000..5000 (end inside a block): master == ramp through loop (max error)"},
+                   Case{1024, 3072, "Loop 1024..3072 (block-aligned): master == ramp through loop (max error)"},
+                   Case{3000, 3100, "Loop 3000..3100 (shorter than a block): master == ramp through loop (max error)"}}) {
+        auto eng = std::make_unique<StemEngine>();
+        eng->prepare(sr, blk, 2);
+        eng->setSource(0, ramp.data(), ramp.data(), len);
+        eng->setLoop(true, c.a, c.b);
+        eng->play();
+        const std::size_t n = 30720;
+        std::vector<float> oL(n), oR(n);
+        for (std::size_t p = 0; p < n; p += blk) eng->process(oL.data() + p, oR.data() + p, blk);
+        double err = 0;
+        std::uint64_t q = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            err = std::max(err, std::fabs(double(ramp[q]) - oL[i]));
+            if (++q >= c.b) q = c.a;
+        }
+        check(err < 1e-7, c.name, err);
+        check(eng->playhead() == q, "  ...and the playhead lands where the loop says", double(eng->playhead()));
+        eng->shutdown();
+    }
+    {   // Playing from past the loop end plays straight through (no jump back).
+        auto eng = std::make_unique<StemEngine>();
+        eng->prepare(sr, blk, 2);
+        eng->setSource(0, ramp.data(), ramp.data(), len);
+        eng->setLoop(true, 1000, 5000);
+        eng->seek(8000);
+        eng->play();
+        std::vector<float> oL(4096), oR(4096);
+        for (std::size_t p = 0; p < 4096; p += blk) eng->process(oL.data() + p, oR.data() + p, blk);
+        double err = 0;
+        for (std::size_t i = 0; i < 4096; ++i) err = std::max(err, std::fabs(double(ramp[8000 + i]) - oL[i]));
+        check(err < 1e-7, "Loop: playing from after the loop end plays straight on (max error)", err);
+        eng->setLoop(false, 1000, 5000);
+        eng->shutdown();
+    }
+}
+
 static void benchEngine() {
     // Full chain on every stem: EQ (2 bands active) + Comp + Artifact Destroyer;
     // master: EQ + Limiter. Measures real-time factor on THIS machine.
@@ -317,6 +363,80 @@ static void benchEngine() {
     eng->shutdown();
 }
 
+static void testResonance() {
+    // Pink-ish noise + a loud narrow 3.2 kHz "ring". The suppressor should
+    // pull the ring down relative to the surrounding noise band.
+    const double sr = 48000; const std::size_t n = std::size_t(sr * 6);
+    std::vector<float> L(n), R(n);
+    std::mt19937 rng(9); std::normal_distribution<float> g(0, 0.05f);
+    for (std::size_t i = 0; i < n; ++i) { L[i] = g(rng) + 0.08f * std::sin(2 * float(kPi) * 3200.f * float(i) / float(sr)); R[i] = L[i]; }
+    // 4 cascaded band-passes (~ -56 dB at the ring) so the "noise" band
+    // measurement isn't contaminated by the ring itself.
+    auto band = [&](const std::vector<float>& x, double f, double q, std::size_t from) {
+        Biquad b2[4]; for (auto& bq : b2) bq.setCoeffs(designBiquad(FilterType::BandPass, sr, f, q, 0));
+        double e = 0;
+        for (std::size_t i = 0; i < x.size(); ++i) { double y = x[i]; for (auto& bq : b2) y = bq.tick(y); if (i >= from) e += y * y; }
+        return 10 * std::log10(e / double(x.size() - from));
+    };
+    const double ringIn = band(L, 3200, 30, 48000), nbIn = band(L, 6000, 4, 48000);
+    ResonanceProcessor rp; rp.param(ResonanceProcessor::kCompensation).set(0); rp.prepare(sr, 512);
+    for (std::size_t p = 0; p + 512 <= n; p += 512) { AudioBlock b{{L.data() + p, R.data() + p}, 2, 512}; rp.process(b); }
+    const std::size_t lat = rp.latency();
+    const double ringOut = band(L, 3200, 30, 48000 + lat), nbOut = band(L, 6000, 4, 48000 + lat);
+    std::printf("        ring %+.2f dB, neighbouring noise %+.2f dB\n", ringOut - ringIn, nbOut - nbIn);
+    check(ringOut - ringIn < -3.0, "Resonance: 3.2 kHz ring reduced by > 3 dB", ringOut - ringIn, "dB");
+    check(std::fabs(nbOut - nbIn) < 1.0, "Resonance: noise band at 6 kHz changes < 1.0 dB", nbOut - nbIn, "dB");
+}
+
+static void testResonanceTransparent() {
+    ResonanceProcessor rp; rp.param(ResonanceProcessor::kReduction).set(0); rp.prepare(48000, 512);
+    const std::size_t n = 48000; std::vector<float> L(n), R(n), oL, oR;
+    std::mt19937 rng(10); std::normal_distribution<float> g(0, 0.2f);
+    for (std::size_t i = 0; i < n; ++i) { L[i] = g(rng); R[i] = g(rng); }
+    oL = L; oR = R;
+    for (std::size_t p = 0; p + 512 <= n; p += 512) { AudioBlock b{{oL.data() + p, oR.data() + p}, 2, 512}; rp.process(b); }
+    const std::size_t lat = rp.latency(); double err = 0, sig = 0;
+    for (std::size_t i = lat; i + 512 < n; ++i) { err += std::pow(oL[i] - L[i - lat], 2) + std::pow(oR[i] - R[i - lat], 2); sig += L[i - lat] * L[i - lat] + R[i - lat] * R[i - lat]; }
+    check(10 * std::log10(err / sig) < -90, "Resonance, reduction = 0 → transparent (error dB)", 10 * std::log10(err / sig), "dB");
+}
+
+static void testTransient() {
+    // Decaying 200 Hz hits every 0.5 s. +12 dB ATTACK must raise the onset
+    // peak; SUSTAIN −12 dB must lower the tail; 0/0 must be bit-transparent.
+    const double sr = 48000; const std::size_t n = std::size_t(sr * 4);
+    std::vector<float> x(n);
+    for (std::size_t i = 0; i < n; ++i) { const double t = double(i % 24000) / sr; x[i] = float(0.3 * std::exp(-t * 6) * std::sin(2 * kPi * 200 * t)); }
+    auto run = [&](float a, float s) {
+        std::vector<float> L = x, R = x;
+        TransientProcessor tp; tp.param(TransientProcessor::kAttack).set(a); tp.param(TransientProcessor::kSustain).set(s);
+        tp.prepare(sr, 512);
+        for (std::size_t p = 0; p + 512 <= n; p += 512) { AudioBlock b{{L.data() + p, R.data() + p}, 2, 512}; tp.process(b); }
+        return L;
+    };
+    auto seg = [&](const std::vector<float>& v, double t0, double t1) {
+        double e = 0; std::size_t c = 0;
+        for (std::size_t h = 1; h < 7; ++h) for (std::size_t i = h * 24000 + std::size_t(t0 * sr); i < h * 24000 + std::size_t(t1 * sr); ++i) { e += v[i] * v[i]; ++c; }
+        return 10 * std::log10(e / double(c));
+    };
+    const auto flat = run(0, 0), atk = run(12, 0), sus = run(0, -12);
+    double maxd = 0; for (std::size_t i = 0; i < n; ++i) maxd = std::max(maxd, double(std::fabs(flat[i] - x[i])));
+    check(maxd < 1e-6, "Transient 0/0 → unchanged (max abs diff)", maxd);
+    const double onIn = seg(x, 0.0, 0.01), onAtk = seg(atk, 0.0, 0.01);
+    const double tailIn = seg(x, 0.2, 0.45), tailSus = seg(sus, 0.2, 0.45), onSus = seg(sus, 0.0, 0.01);
+    check(onAtk - onIn > 3.0, "Transient ATTACK +12: first 10 ms of each hit louder by > 3 dB", onAtk - onIn, "dB");
+    check(tailSus - tailIn < -4.0, "Transient SUSTAIN −12: tail (200–450 ms) quieter by > 4 dB", tailSus - tailIn, "dB");
+    check(std::fabs(onSus - onIn) < 1.5, "Transient SUSTAIN −12: onset nearly unchanged", onSus - onIn, "dB");
+}
+
+static void testWidth() {
+    std::vector<float> L(1024), R(1024);
+    for (std::size_t i = 0; i < 1024; ++i) { L[i] = std::sin(float(i) * 0.05f); R[i] = std::cos(float(i) * 0.031f); }
+    WidthProcessor w; w.param(0).set(0); w.prepare(48000, 1024); w.param(0).snap();
+    AudioBlock b{{L.data(), R.data()}, 2, 1024}; w.process(b);
+    double d = 0; for (std::size_t i = 0; i < 1024; ++i) d = std::max(d, double(std::fabs(L[i] - R[i])));
+    check(d < 1e-6, "Width 0 % → mono (max |L−R|)", d);
+}
+
 int main() {
     simd::ScopedFlushDenormals ftz;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -324,7 +444,9 @@ int main() {
     testComplexFFT(); testRealFFT(); testStftIdentity(); testKWeighting();
     testLoudness(); testTruePeak(); testLimiter();
     testArtifactLatencyAndTransparency(); testArtifactShimmerReduction();
-    testEngine(); benchEngine();
+    testResonance(); testResonanceTransparent(); testTransient(); testWidth();
+    testEngine();
+    testLoop(); benchEngine();
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }

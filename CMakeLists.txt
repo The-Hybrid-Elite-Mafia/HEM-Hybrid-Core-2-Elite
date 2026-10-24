@@ -1,14 +1,13 @@
 # =============================================================================
-#  HYBRID CORE 2 ELITE — build. Zero third-party dependencies.
-#  Started from THE HYBRID CORE 2.0 (github.com/The-Hybrid-Elite-Mafia/hybrid-core, commit a77d3cd).
+#  THE HYBRID CORE 2.0 — build. Zero third-party dependencies.
 #  Windows (Visual Studio 2022):  cmake -B build -G "Visual Studio 17 2022" -A x64
 #                                 cmake --build build --config Release
 #  Linux/macOS (offline tools):   cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build
 # =============================================================================
 cmake_minimum_required(VERSION 3.20)
-project(HybridCore2Elite LANGUAGES CXX VERSION 2.0.0)
+project(HybridCore2Elite LANGUAGES CXX VERSION 2.1.0)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -39,4 +38,18 @@ endif()
 if(WIN32)
   add_executable(hc_play apps/hc_play.cpp src/platform/wasapi_output.cpp)
   target_link_libraries(hc_play PRIVATE hybrid_core ole32 avrt)
+
+  # THE HYBRID CORE Studio — the faceplate app.
+  add_executable(HybridCore2Elite WIN32 studio/main.cpp studio/gfx.cpp src/platform/wasapi_output.cpp studio/studio.rc)
+  target_include_directories(HybridCore2Elite PRIVATE studio)
+  target_compile_definitions(HybridCore2Elite PRIVATE UNICODE _UNICODE)
+  target_link_libraries(HybridCore2Elite PRIVATE hybrid_core d3d11 dxgi d3dcompiler windowscodecs ole32 uuid avrt comdlg32 shell32 gdi32 user32)
+  if(MSVC)
+    target_link_options(HybridCore2Elite PRIVATE /ENTRY:wWinMainCRTStartup /MANIFEST:NO)
+  else()
+    target_link_options(HybridCore2Elite PRIVATE -municode)
+  endif()
+
+  # Installer: embeds the built HybridCore2Elite.exe (setup.rc points at ../build-win/HybridCore2Elite.exe;
+  # build_windows.sh produces dist/HybridCore2Elite-Setup.exe the same way).
 endif()

@@ -11,6 +11,8 @@
 #include "hc/dsp/stft.hpp"
 #include "hc/engine/processor.hpp"
 #include "hc/repair/artifact_engine.hpp"
+#include "hc/repair/resonance.hpp"
+#include "hc/dsp/transient.hpp"
 #include <array>
 
 namespace hc {
@@ -135,14 +137,18 @@ private:
 // ----------------------------------------------------------------------------- Artifact Destroyer
 class ArtifactProcessor final : public IProcessor {
 public:
-    enum : std::size_t { kShimmer, kShimTol, kSib, kSibThr, kPhase, kSplit, kFloor, kNumParams };
-    ArtifactProcessor() : kernel_(settings_, telemetry_) {}
+    enum : std::size_t { kShimmer, kShimTol, kSib, kSibThr, kPhase, kSplit, kFloor, kRes, kDecay, kNumParams };
+    ArtifactProcessor() : kernel_(settings_, telemetry_) { settings_.sibilanceAmount.set(0.0f); }
     const ProcessorInfo& info() const noexcept override { return kInfo; }
     void prepare(double sr, std::uint32_t) override {
         // ~21 ms frames / ~5.3 ms hop at any rate: HF repair needs time
         // resolution far more than frequency resolution (bins are 47 Hz wide
         // at 48 kHz — irrelevant above 7 kHz). Latency = 1024 @ 48 k.
-        const std::size_t n = sr > 60000.0 ? 2048 : 1024;
+        // RESOLUTION selector: 1024 / 2048 / 4096 at 44.1–48 kHz (doubled
+        // above 60 kHz). Changing it rebuilds the chain off the audio thread.
+        const int res = static_cast<int>(std::lround(settings_.resolution.target()));
+        std::size_t n = std::size_t{1024} << std::clamp(res, 0, 2);
+        if (sr > 60000.0) n *= 2;
         stft_.prepare(sr, n, 4);
         kernel_.prepare(sr, n, stft_.hop());
     }
@@ -160,7 +166,8 @@ public:
         case kShimmer: return settings_.shimmerAmount;   case kShimTol: return settings_.shimmerTolDb;
         case kSib: return settings_.sibilanceAmount;     case kSibThr: return settings_.sibilanceThreshDb;
         case kPhase: return settings_.phaseAmount;       case kSplit: return settings_.splitHz;
-        default: return settings_.floorDb;
+        case kFloor: return settings_.floorDb;           case kRes: return settings_.resolution;
+        default: return settings_.decayMs;
         }
     }
     float meterValue() const noexcept override { return telemetry_.shimmerCutDb.load(std::memory_order_relaxed); }
@@ -170,9 +177,10 @@ private:
     struct PassKernel final : ISpectralKernel { int dummy = 0; void processFrame(SpectralFrame&) noexcept override {} };
     static constexpr ParamDesc kParams[kNumParams] = {
         {"shimmer", "Shimmer", "", 0, 1, 0.6f}, {"shim_tol", "Tolerance", "dB", 0, 12, 1.5f},
-        {"sib", "De-Ess", "", 0, 1, 0.5f},      {"sib_thr", "Ess Thresh", "dB", -30, 12, 0},
+        {"sib", "De-Ess", "", 0, 1, 0.0f},      {"sib_thr", "Ess Thresh", "dB", -30, 12, 0},
         {"phase", "Phase Fix", "", 0, 1, 0.3f}, {"split", "HF Split", "Hz", 2000, 16000, 7000, Taper::Log},
-        {"floor", "Max Cut", "dB", -40, 0, -15}};
+        {"floor", "Max Cut", "dB", -40, 0, -15},
+        {"res", "STFT Resolution", "", 0, 2, 0},       {"decay", "Decay", "ms", 5, 200, 10, Taper::Log}};
     static constexpr FaceplateControl kFace[] = {
         {ControlKind::SpectrumView, -1, 0.5f, 0.28f, 0.9f},
         {ControlKind::Knob, kShimmer, 0.10f, 0.78f, 0.12f}, {ControlKind::Knob, kShimTol, 0.24f, 0.78f, 0.09f},
@@ -233,12 +241,123 @@ private:
     LookaheadLimiter lim_;
 };
 
+// ----------------------------------------------------------------------------- Resonance
+class ResonanceProcessor final : public IProcessor {
+public:
+    enum : std::size_t { kSensitivity, kFrequency, kBandwidth, kReduction, kCompensation, kMode, kNumParams };
+    ResonanceProcessor() : kernel_(settings_) {}
+    const ProcessorInfo& info() const noexcept override { return kInfo; }
+    void prepare(double sr, std::uint32_t) override {
+        const std::size_t n = sr > 60000.0 ? 4096 : 2048;
+        stft_.prepare(sr, n, 4);
+        kernel_.prepare(sr, n, stft_.hop());
+    }
+    void reset() noexcept override { stft_.reset(); kernel_.reset(); }
+    void process(AudioBlock& b) noexcept override {
+        if (bypassed()) { stft_.process(b, pass_); return; }   // latency stays constant
+        stft_.process(b, kernel_);
+    }
+    std::uint32_t latency() const noexcept override { return static_cast<std::uint32_t>(stft_.latency()); }
+    std::size_t numParams() const noexcept override { return kNumParams; }
+    AtomicParam& param(std::size_t i) noexcept override {
+        switch (i) {
+        case kSensitivity: return settings_.sensitivity; case kFrequency: return settings_.frequency;
+        case kBandwidth: return settings_.bandwidth;     case kReduction: return settings_.reduction;
+        case kCompensation: return settings_.compensation; default: return settings_.mode;
+        }
+    }
+    TripleBuffer<ResonanceView>& view() noexcept { return kernel_.view(); }
+
+private:
+    struct PassKernel final : ISpectralKernel { void processFrame(SpectralFrame&) noexcept override {} };
+    static constexpr ParamDesc kParams[kNumParams] = {
+        {"sens", "Sensitivity", "%", 0, 100, 50},        {"freq", "Frequency", "Hz", 200, 16000, 3500, Taper::Log},
+        {"bw", "Bandwidth", "oct", 0.5f, 8, 5},          {"red", "Reduction", "dB", 0, 18, 6},
+        {"comp", "Compensation", "%", 0, 100, 50},       {"mode", "Mode", "", 0, 2, 1}};
+    static constexpr FaceplateControl kFace[] = {
+        {ControlKind::SpectrumView, -1, 0.5f, 0.3f, 0.9f},
+        {ControlKind::Knob, kSensitivity, 0.1f, 0.8f, 0.1f}, {ControlKind::Knob, kFrequency, 0.3f, 0.8f, 0.1f},
+        {ControlKind::Knob, kBandwidth, 0.5f, 0.8f, 0.1f},   {ControlKind::Knob, kReduction, 0.7f, 0.8f, 0.1f},
+        {ControlKind::Knob, kCompensation, 0.9f, 0.8f, 0.1f}};
+    static inline const ProcessorInfo kInfo{"hc.resonance", "HEM Resonance", "Repair", 1, kParams, {2.6f, 0x3EB8FFFF, kFace}};
+    ResonanceSettings settings_;
+    ResonanceKernel kernel_;
+    PassKernel pass_;
+    StftEngine stft_;
+};
+
+// ----------------------------------------------------------------------------- Transient
+class TransientProcessor final : public IProcessor {
+public:
+    enum : std::size_t { kAttack, kSustain, kSpeed, kGain, kMix, kNumParams };
+    const ProcessorInfo& info() const noexcept override { return kInfo; }
+    void prepare(double sr, std::uint32_t) override { sh_.prepare(sr); }
+    void reset() noexcept override { sh_.reset(); }
+    void process(AudioBlock& b) noexcept override {
+        if (bypassed()) return;
+        sh_.process(b, p_[kAttack].target(), p_[kSustain].target(), p_[kSpeed].target() > 0.5f ? 1 : 0,
+                    p_[kMix].target() * 0.01f, p_[kGain].target(), &viz_);
+    }
+    std::size_t numParams() const noexcept override { return kNumParams; }
+    AtomicParam& param(std::size_t i) noexcept override { return p_[i < kNumParams ? i : 0]; }
+    SpscRing<TransientViz, 2048>& viz() noexcept { return viz_; }
+    bool active() const noexcept { return sh_.active(); }
+
+private:
+    static constexpr ParamDesc kParams[kNumParams] = {
+        {"attack", "Attack", "dB", -15, 15, 0},  {"sustain", "Sustain", "dB", -15, 15, 0},
+        {"speed", "Punch/Speed", "", 0, 1, 0},   {"gain", "Gain", "dB", -12, 12, 0, Taper::Decibel},
+        {"mix", "Mix", "%", 0, 100, 100}};
+    static constexpr FaceplateControl kFace[] = {
+        {ControlKind::Knob, kAttack, 0.1f, 0.8f, 0.12f}, {ControlKind::Knob, kSustain, 0.3f, 0.8f, 0.12f},
+        {ControlKind::Switch, kSpeed, 0.5f, 0.8f, 0.05f}, {ControlKind::Knob, kGain, 0.7f, 0.8f, 0.12f},
+        {ControlKind::Knob, kMix, 0.9f, 0.8f, 0.12f}};
+    static inline const ProcessorInfo kInfo{"hc.transient", "HEM Transient", "Dynamics", 1, kParams, {2.6f, 0x3EB8FFFF, kFace}};
+    std::array<AtomicParam, kNumParams> p_{AtomicParam(0, -15, 15), AtomicParam(0, -15, 15), AtomicParam(0, 0, 1),
+                                           AtomicParam(0, -12, 12), AtomicParam(100, 0, 100)};
+    TransientShaper sh_;
+    SpscRing<TransientViz, 2048> viz_;
+};
+
+// ----------------------------------------------------------------------------- Width
+class WidthProcessor final : public IProcessor {
+public:
+    enum : std::size_t { kWidth, kNumParams };
+    const ProcessorInfo& info() const noexcept override { return kInfo; }
+    void prepare(double sr, std::uint32_t) override { p_[0].prepare(sr, 30.0); }
+    void reset() noexcept override {}
+    void process(AudioBlock& b) noexcept override {
+        if (bypassed() || b.numChannels < 2) return;
+        // M/S: width 0 % = mono, 100 % = unchanged, 200 % = side doubled.
+        const float w0 = p_[0].current() * 0.01f;
+        const float w1 = p_[0].advance(b.numFrames) * 0.01f;
+        const float dw = (w1 - w0) / static_cast<float>(b.numFrames ? b.numFrames : 1);
+        float* L = b.ch[0]; float* R = b.ch[1];
+        for (std::uint32_t i = 0; i < b.numFrames; ++i) {
+            const float w = w0 + dw * static_cast<float>(i);
+            const float m = 0.5f * (L[i] + R[i]), s = 0.5f * (L[i] - R[i]) * w;
+            L[i] = m + s; R[i] = m - s;
+        }
+    }
+    std::size_t numParams() const noexcept override { return kNumParams; }
+    AtomicParam& param(std::size_t) noexcept override { return p_[0]; }
+
+private:
+    static constexpr ParamDesc kParams[kNumParams] = {{"width", "Width", "%", 0, 200, 100}};
+    static constexpr FaceplateControl kFace[] = {{ControlKind::Knob, kWidth, 0.5f, 0.5f, 0.3f}};
+    static inline const ProcessorInfo kInfo{"hc.width", "HEM Width", "Master", 1, kParams, {1.0f, 0x3EB8FFFF, kFace}};
+    std::array<AtomicParam, kNumParams> p_{AtomicParam(100, 0, 200)};
+};
+
 inline ProcessorRegistry makeBuiltinRegistry() {
     ProcessorRegistry r;
     r.add("hc.eq6", [] { return std::unique_ptr<IProcessor>(new Eq6()); });
     r.add("hc.comp", [] { return std::unique_ptr<IProcessor>(new CompProcessor()); });
     r.add("hc.artifact", [] { return std::unique_ptr<IProcessor>(new ArtifactProcessor()); });
     r.add("hc.limiter", [] { return std::unique_ptr<IProcessor>(new LimiterProcessor()); });
+    r.add("hc.resonance", [] { return std::unique_ptr<IProcessor>(new ResonanceProcessor()); });
+    r.add("hc.transient", [] { return std::unique_ptr<IProcessor>(new TransientProcessor()); });
+    r.add("hc.width", [] { return std::unique_ptr<IProcessor>(new WidthProcessor()); });
     return r;
 }
 

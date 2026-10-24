@@ -1,39 +1,65 @@
 # HYBRID CORE 2 ELITE — Hybrid Elite Mafia
 
-The desk studio for AI stems: 13 stems in, AI artifacts cleaned out, mixed, mastered to a loudness target.
+The producer desk: a 13-stem repair, mixing and mastering studio for Windows, written from scratch in C++23.
+Built from THE HYBRID CORE 2.0 (repo `hybrid-core`, its own separate app — this one installs next to it and never touches it).
+It uses no JUCE, no Qt and no third-party libraries — only the C++ standard library and Windows itself
+(WASAPI audio, Direct3D 11 graphics).
 
-Started from **THE HYBRID CORE 2.0** (github.com/The-Hybrid-Elite-Mafia/hybrid-core, commit a77d3cd), a separate
-project that keeps its own name and history. This repository is its own app; changes here never go back there.
+## Install
 
----
+1. Download **`HybridCore2Elite-Setup.exe`** (built by `build_windows.sh` into `dist/`).
+2. Run it. Windows may show "Windows protected your PC" because the file isn't code-signed.
+   Click **More info → Run anyway**.
+3. Click **Yes**. It installs to `%LOCALAPPDATA%\Programs\HEM Hybrid Core 2 Elite`, adds Start menu and desktop
+   shortcuts (HYBRID CORE 2 ELITE). No admin rights are needed.
 
+To uninstall: **Settings → Apps → HYBRID CORE 2 ELITE → Uninstall**. Your stems, sessions and exports
+are never touched.
 
-Scratch-built 13-stem audio engine, artifact-repair DSP and mastering tools in pure C++20.
-No JUCE, no Qt, no third-party libraries — only the C++ standard library and the Windows SDK.
+## Using it
 
-## Build on Windows (Visual Studio 2022)
+The window is a night-city studio desk with six monitors, and every monitor is a live screen:
 
-    cmake -B build -G "Visual Studio 17 2022" -A x64
-    cmake --build build --config Release
+| Top row | STFT DESTROYER · NOW PLAYING (wide) · RESONANCE |
+|---|---|
+| **Bottom row** | **TRANSIENT · CONSOLE (tracks + transport) · MASTERING** |
 
-Produces `hc_tests.exe`, `hc_render.exe`, `hc_play.exe` in `build\Release`.
-Prebuilt Windows x64 binaries (cross-compiled with MinGW-w64, static) are in `bin-windows/`.
+Click a monitor and it fills the window to work on it; **Esc** or **DESK** (top-right) goes back to the desk;
+**Tab / Shift+Tab** or `<` `>` step through the screens. On the desk, the audio interface plays / stops and the
+crown is the about box. DESTROYER, RESONANCE and TRANSIENT work on one stem at a time (each stem has its own
+copy); `< STEM 7 - VOCALS >` at their top-left picks which. MASTERING is the whole mix. NOW PLAYING shows the
+song, clock, bar/beat, tempo, loop, master loudness and true peaks, and an overview of the whole song —
+click or drag it to move the playhead. F11 = full screen.
 
-## Run
+| Part | What it does |
+|---|---|
+| Track rows 1–13 | Drag the stems — or their whole folder — onto the window. Or click the box in the middle (≡ → Load Stems, Ctrl+L): the picker shows the WAVs; click any one and its whole folder loads, or select just the ones you want. Click a name to select it; drag left/right for volume; double-click for 0 dB; right-click for load/remove. M = mute, S = solo. |
+| Transport | Every button is drawn live (lights, presses, hover) — nothing painted. ≡ menu · ⏮ rewind · ▶ play · ■ stop · ● export master · ⟳ LOOP · time · tempo (drag to set) · master level · analyze (per-stem LUFS on the lanes) · ⚙ audio settings · ⊞ full screen |
+| HEM STFT DESTROYER | Artifact repair for the selected stem: LIGHT/MEDIUM/HEAVY, STFT resolution, Threshold, Bleed (HF stereo phase fix), Decay. Live spectrogram. The switch or the title toggles bypass. |
+| HEM RESONANCE | Dynamic harsh-resonance suppressor: Sensitivity, Frequency, Bandwidth, Reduction, Compensation, SOFT/NORMAL/FAST. The screen shows the spectrum and the live cut curve. |
+| HEM TRANSIENT | Transient designer: Attack, Sustain, Punch/Speed, Gain, Mix. Live activity screens. The LED toggles bypass. |
+| HEM MASTERING | Master bus: Width → glue (MODE: CLEAN/PUNCH/LOUD) → true-peak limiter (Ceiling, Threshold, Release). LUFS M/S and L/R true-peak meters; Integrated, Short-term, PSR, PLR, LRA. The selector and TARGET set the export loudness. |
 
-    hc_tests                                   (verification suite — should end "ALL PASSED")
-    hc_render --target -14 --ceiling -1 master.wav stem1.wav ... stem13.wav
-    hc_play [--exclusive] stem1.wav ... stem13.wav
+Loop: drag across the bar numbers to set the section (snaps to whole bars; Shift = free), click the bar numbers to jump; LOOP or **L** turns it on/off; with no section set it loops the whole song. The wrap is sample-exact inside the audio engine (no gap). Export always renders the whole song. Saved in the session.
 
-hc_render options: `--shimmer 0..1`, `--deess 0..1`, `--phase 0..1`, `--no-repair`,
-`--deess-all`, `--float`. All stems must share one sample rate.
+Keys: Space play/stop · Home rewind · L loop · Tab next screen · Esc / F9 back to the desk · Ctrl+L load · Ctrl+E export · Ctrl+O / Ctrl+S open/save session.
+Knobs: drag up/down (Shift = fine), mouse wheel, double-click = default.
+
+Export writes a 24-bit WAV. With a target set, it renders three passes (measure → limit → verify) so the
+master lands on the target LUFS under the true-peak ceiling.
+
+## Build
+
+- **From Linux (the tested path):** `./build_windows.sh` → `dist/HybridCore-Setup.exe` (MinGW-w64).
+- **Windows / Visual Studio 2022:** `cmake -B build -G "Visual Studio 17 2022" -A x64` then
+  `cmake --build build --config Release`. This adds a `HybridCore` target. The MSVC build of the Studio
+  app has **not** been tested yet; the MinGW build has.
+- **Engine tests (any OS):** build and run `hc_tests` — it should end `ALL PASSED`.
 
 ## Status
 
-- Verified: FFT, STFT/OLA, loudness (BS.1770-4/R128), true peak, limiter, 13-stem engine,
-  delay compensation, Artifact Destroyer (synthetic tests), ASan/UBSan/TSan clean.
-- Compiled but NOT yet run on real hardware: the WASAPI backend (`hc_play`).
-- Not yet tested on real Suno stems.
-- Not built yet: GPU Graphics Engine, ASIO backend (needs Steinberg's ASIO SDK).
-
-See the Technical Blueprint doc for architecture and DSP theory.
+- Tested: engine DSP (FFT, STFT, BS.1770 loudness, true peak, limiter, Artifact Destroyer, Resonance,
+  Transient, Width), the 13-stem engine (sanitizers clean), the installer and uninstaller, and the app
+  rendering and playing 13 stems under Wine.
+- Not built yet: ASIO (it needs Steinberg's SDK; the faceplate art mentions ASIO, but playback is WASAPI).
+- Stems must all have the same sample rate (there's no resampler yet).

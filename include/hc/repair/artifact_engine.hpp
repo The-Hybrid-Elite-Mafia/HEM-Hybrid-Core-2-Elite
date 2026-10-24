@@ -67,6 +67,8 @@ struct ArtifactSettings {
     AtomicParam phaseAmount{0.3f, 0.0f, 1.0f};
     AtomicParam splitHz{7000.0f, 2000.0f, 16000.0f};
     AtomicParam floorDb{-15.0f, -40.0f, 0.0f};      // maximum per-bin reduction
+    AtomicParam resolution{0.0f, 0.0f, 2.0f};       // 0/1/2 → FFT 1024/2048/4096 (applied on prepare)
+    AtomicParam decayMs{10.0f, 5.0f, 200.0f};       // gain release of the shimmer smoother
 };
 
 // Diagnostics published to the UI / reports (relaxed atomics, audio writes).
@@ -99,6 +101,7 @@ public:
         const double fps = sr / static_cast<double>(hop);
         auto coef = [&](double ms) { return static_cast<float>(std::exp(-1.0 / (fps * ms * 0.001))); };
         envCoef_ = coef(120.0);
+        fps_ = fps;
         gainRel_ = coef(10.0);   // swept 10–40 ms: 10 ms gives the most jitter reduction (see blueprint §6.1)
         sibAtt_ = coef(5.0);
         sibRel_ = coef(60.0);
@@ -131,6 +134,10 @@ public:
         const float shimAmt = s_.shimmerAmount.target(), shimTol = s_.shimmerTolDb.target();
         const float sibAmt = s_.sibilanceAmount.target(), sibThr = s_.sibilanceThreshDb.target();
         const float phAmt = s_.phaseAmount.target(), floorDb = s_.floorDb.target();
+        {   // DECAY knob: release of the per-bin gain, read every frame.
+            const float ms = s_.decayMs.target();
+            if (ms != lastDecayMs_) { lastDecayMs_ = ms; gainRel_ = static_cast<float>(std::exp(-1.0 / (fps_ * ms * 0.001))); }
+        }
         const std::size_t kSplit = binOf(s_.splitHz.target());
 
         // --- Mid/side power ---------------------------------------------------
@@ -280,7 +287,8 @@ private:
     static constexpr std::size_t kOlaFrames = 4;   // = overlap factor of the STFT
     AlignedBuffer<float> gHist_[kOlaFrames];
     std::size_t gHistPos_ = 0;
-    float binGatePow_ = 0, sibGatePow_ = 0, ltCoef_ = 0;
+    float binGatePow_ = 0, sibGatePow_ = 0, ltCoef_ = 0, lastDecayMs_ = -1.0f;
+    double fps_ = 187.5;
     float envCoef_ = 0, gainRel_ = 0, sibAtt_ = 0, sibRel_ = 0, xCoef_ = 0, sibGainDb_ = 0;
     AlignedBuffer<float> envDb_, prevDb_, shimGainDb_, rawGain_, mask_, sxx_, syy_, sxyRe_, sxyIm_, midPow_, sidePow_, ltIn_, ltOut_, makeupDb_;
 };

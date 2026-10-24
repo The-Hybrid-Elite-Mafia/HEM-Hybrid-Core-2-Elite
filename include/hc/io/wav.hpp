@@ -10,6 +10,7 @@
 #include <iterator>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <random>
 #include <string>
@@ -24,6 +25,11 @@ struct Audio {
 };
 
 namespace detail {
+// UTF-8 file name for error messages (safe for any Windows path).
+inline std::string displayName(const std::filesystem::path& p) {
+    const auto u = p.filename().u8string();
+    return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
 inline std::uint32_t u32(const unsigned char* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (std::uint32_t(p[3]) << 24); }
 inline std::uint16_t u16(const unsigned char* p) { return static_cast<std::uint16_t>(p[0] | (p[1] << 8)); }
 inline void put32(std::ofstream& f, std::uint32_t v) { unsigned char b[4] = {(unsigned char)v, (unsigned char)(v >> 8), (unsigned char)(v >> 16), (unsigned char)(v >> 24)}; f.write((char*)b, 4); }
@@ -31,9 +37,10 @@ inline void put16(std::ofstream& f, std::uint16_t v) { unsigned char b[2] = {(un
 } // namespace detail
 
 // Returns empty string on success, else an error message.
-inline std::string read(const std::string& path, Audio& out) {
+inline std::string read(const std::filesystem::path& file, Audio& out) {
     using namespace detail;
-    std::ifstream f(path, std::ios::binary);
+    const std::string path = displayName(file);
+    std::ifstream f(file, std::ios::binary);
     if (!f) return "cannot open " + path;
     std::vector<unsigned char> d((std::istreambuf_iterator<char>(f)), {});
     if (d.size() < 12 || std::memcmp(d.data(), "RIFF", 4) || std::memcmp(d.data() + 8, "WAVE", 4)) return path + ": not a RIFF/WAVE file";
@@ -73,9 +80,10 @@ inline std::string read(const std::string& path, Audio& out) {
     return {};
 }
 
-inline std::string write(const std::string& path, const Audio& a, bool float32 = false) {
+inline std::string write(const std::filesystem::path& file, const Audio& a, bool float32 = false) {
     using namespace detail;
-    std::ofstream f(path, std::ios::binary);
+    const std::string path = displayName(file);
+    std::ofstream f(file, std::ios::binary);
     if (!f) return "cannot create " + path;
     const std::uint16_t bits = float32 ? 32 : 24, chans = 2, bps = bits / 8;
     const std::uint64_t n = a.frames();
