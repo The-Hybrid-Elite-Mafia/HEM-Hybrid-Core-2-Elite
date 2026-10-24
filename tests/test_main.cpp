@@ -10,7 +10,10 @@
 #include "hc/meter/spectrum.hpp"
 #include "hc/engine/builtin_processors.hpp"
 #include "hc/engine/stem_engine.hpp"
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <new>
 #include <complex>
 #include <cstdio>
 #include <random>
@@ -18,6 +21,22 @@
 
 using namespace hc;
 static int g_fail = 0;
+
+// Allocation counter for the "no allocation on the audio path" checks: every operator new in the
+// process is counted while g_countAllocs is on.
+static std::atomic<long> g_allocs{0};
+static std::atomic<bool> g_countAllocs{false};
+#pragma GCC diagnostic ignored "-Wmismatched-new-delete"
+void* operator new(std::size_t n) {
+    if (g_countAllocs.load(std::memory_order_relaxed)) g_allocs.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n ? n : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t n) { return operator new(n); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 static void check(bool ok, const char* name, double value, const char* unit = "") {
     std::printf("[%s] %-58s %12.6g %s\n", ok ? "PASS" : "FAIL", name, value, unit);
     if (!ok) ++g_fail;
@@ -331,6 +350,94 @@ static void testLoop() {
     }
 }
 
+
+// ----------------------------------------------------------------------------- Gate / De-esser
+static double rmsDb(const std::vector<float>& x, std::size_t a, std::size_t b) {
+    double s = 0; for (std::size_t i = a; i < b; ++i) s += double(x[i]) * x[i];
+    return 10.0 * std::log10(s / double(b - a) + 1e-30);
+}
+// Level (dB) of one frequency in x[a,b) — Goertzel, normalised so a full-scale sine reads 0 dB.
+static double toneDb(const std::vector<float>& x, std::size_t a, std::size_t b, double f, double sr) {
+    const double w = 2 * kPi * f / sr, c = 2 * std::cos(w);
+    double s1 = 0, s2 = 0;
+    for (std::size_t i = a; i < b; ++i) { const double s0 = x[i] + c * s1 - s2; s2 = s1; s1 = s0; }
+    const double p = s1 * s1 + s2 * s2 - c * s1 * s2;
+    return 10.0 * std::log10(4.0 * p / (double(b - a) * double(b - a)) + 1e-30);
+}
+static void runStereo(IProcessor& p, std::vector<float>& L, std::vector<float>& R, std::uint32_t blk, long* allocs) {
+    g_allocs = 0; g_countAllocs = true;
+    for (std::size_t i = 0; i < L.size(); i += blk) {
+        const std::uint32_t n = std::uint32_t(std::min<std::size_t>(blk, L.size() - i));
+        AudioBlock b{{L.data() + i, R.data() + i}, 2, n};
+        p.process(b);
+    }
+    g_countAllocs = false;
+    if (allocs) *allocs = g_allocs.load();
+}
+
+static void testGate() {
+    const double sr = 48000; const std::size_t seg = 24000;
+    std::mt19937 rng(3); std::normal_distribution<float> g(0, 0.001f);   // noise ≈ −60 dBFS RMS
+    std::vector<float> in(3 * seg);
+    for (std::size_t i = 0; i < in.size(); ++i) in[i] = g(rng);
+    for (std::size_t i = seg; i < 2 * seg; ++i) in[i] += 0.25f * std::sin(float(2 * kPi * 1000.0 * double(i) / sr));
+    GateProcessor gate;
+    gate.param(GateProcessor::kThresh).set(-40); gate.param(GateProcessor::kRange).set(-60);
+    gate.param(GateProcessor::kHold).set(20); gate.param(GateProcessor::kRelease).set(50);
+    gate.prepare(sr, 256);
+    std::vector<float> L = in, R = in;
+    long allocs = -1;
+    runStereo(gate, L, R, 256, &allocs);
+    const double noiseIn = rmsDb(in, seg + 2 * seg + 12000 - 2 * seg, 3 * seg);   // last half of the 3rd segment
+    const double noiseOut = rmsDb(L, 2 * seg + 12000, 3 * seg);
+    const double toneIn = rmsDb(in, seg + 2400, 2 * seg), toneOut = rmsDb(L, seg + 2400, 2 * seg);
+    check(noiseIn - noiseOut > 50.0, "Gate: noise between hits pulled down (dB, Range -60)", noiseIn - noiseOut, "dB");
+    check(std::fabs(toneOut - toneIn) < 0.1, "Gate: hit above threshold passes untouched (level change)", toneOut - toneIn, "dB");
+    check(allocs == 0, "Gate: no memory allocation while processing", double(allocs));
+
+    // Key high-pass: a loud 60 Hz bleed must NOT open the gate when Key HPF = 500 Hz.
+    std::vector<float> low(2 * seg);
+    for (std::size_t i = 0; i < low.size(); ++i) low[i] = 0.1f * std::sin(float(2 * kPi * 60.0 * double(i) / sr));
+    GateProcessor g2;
+    g2.param(GateProcessor::kThresh).set(-30); g2.param(GateProcessor::kRange).set(-60); g2.param(GateProcessor::kKeyHpf).set(500);
+    g2.prepare(sr, 256);
+    std::vector<float> L2 = low, R2 = low;
+    runStereo(g2, L2, R2, 256, nullptr);
+    check(rmsDb(low, seg, 2 * seg) - rmsDb(L2, seg, 2 * seg) > 40.0, "Gate: Key HPF 500 Hz ignores 60 Hz bleed (stays shut, dB down)",
+          rmsDb(low, seg, 2 * seg) - rmsDb(L2, seg, 2 * seg), "dB");
+}
+
+static void testDeEsser() {
+    const double sr = 48000; const std::size_t n = 48000;
+    // 1. Nothing above threshold → output is the input.
+    std::vector<float> lo(n);
+    for (std::size_t i = 0; i < n; ++i) lo[i] = 0.1f * std::sin(float(2 * kPi * 200.0 * double(i) / sr));
+    DeEsserProcessor d;
+    d.param(DeEsserProcessor::kThresh).set(-24);
+    d.prepare(sr, 256);
+    std::vector<float> L = lo, R = lo;
+    long allocs = -1;
+    runStereo(d, L, R, 256, &allocs);
+    double err = 0; for (std::size_t i = 0; i < n; ++i) err = std::max(err, double(std::fabs(L[i] - lo[i])));
+    check(err < 1e-6, "De-esser: below threshold the output equals the input (max error)", err);
+    check(allocs == 0, "De-esser: no memory allocation while processing", double(allocs));
+
+    // 2. Loud 8 kHz "ess" + 200 Hz body: the 8 kHz comes down ~12 dB (Max Cut), the 200 Hz stays.
+    std::vector<float> mix(n);
+    for (std::size_t i = 0; i < n; ++i)
+        mix[i] = 0.1f * std::sin(float(2 * kPi * 200.0 * double(i) / sr)) + 0.5f * std::sin(float(2 * kPi * 8000.0 * double(i) / sr));
+    DeEsserProcessor d2;
+    d2.param(DeEsserProcessor::kFreq).set(5000); d2.param(DeEsserProcessor::kThresh).set(-24); d2.param(DeEsserProcessor::kMaxCut).set(12);
+    d2.prepare(sr, 256);
+    std::vector<float> L2 = mix, R2 = mix;
+    runStereo(d2, L2, R2, 256, nullptr);
+    const std::size_t a = 9600, b = n;
+    const double cut8k = toneDb(mix, a, b, 8000, sr) - toneDb(L2, a, b, 8000, sr);
+    const double ch200 = toneDb(L2, a, b, 200, sr) - toneDb(mix, a, b, 200, sr);
+    check(cut8k > 8.0 && cut8k <= 12.5, "De-esser: loud 8 kHz pulled down (dB, Max Cut 12, shelf at 5 kHz)", cut8k, "dB");
+    check(std::fabs(ch200) < 0.5, "De-esser: 200 Hz body unchanged (level change)", ch200, "dB");
+}
+
 static void benchEngine() {
     // Full chain on every stem: EQ (2 bands active) + Comp + Artifact Destroyer;
     // master: EQ + Limiter. Measures real-time factor on THIS machine.
@@ -440,13 +547,13 @@ static void testWidth() {
 int main() {
     simd::ScopedFlushDenormals ftz;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::printf("THE HYBRID CORE 2.0 — engine verification (%s)\n\n", HC_AVX2 ? "AVX2 build" : "SCALAR build");
+    std::printf("HYBRID CORE 2 ELITE — engine verification (%s)\n\n", HC_AVX2 ? "AVX2 build" : "SCALAR build");
     testComplexFFT(); testRealFFT(); testStftIdentity(); testKWeighting();
     testLoudness(); testTruePeak(); testLimiter();
     testArtifactLatencyAndTransparency(); testArtifactShimmerReduction();
     testResonance(); testResonanceTransparent(); testTransient(); testWidth();
     testEngine();
-    testLoop(); benchEngine();
+    testLoop(); testGate(); testDeEsser(); benchEngine();
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }

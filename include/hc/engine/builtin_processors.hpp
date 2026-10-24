@@ -4,6 +4,7 @@
 //    hc.comp      stereo-linked soft-knee compressor
 //    hc.artifact  HF Artifact Destroyer (STFT, see repair/artifact_engine.hpp)
 //    hc.limiter   true-peak lookahead brick-wall limiter (master)
+//    hc.gate, hc.deess — see stem_tools.hpp
 // =============================================================================
 #pragma once
 #include "hc/dsp/biquad.hpp"
@@ -13,6 +14,7 @@
 #include "hc/repair/artifact_engine.hpp"
 #include "hc/repair/resonance.hpp"
 #include "hc/dsp/transient.hpp"
+#include "hc/engine/stem_tools.hpp"
 #include <array>
 
 namespace hc {
@@ -54,6 +56,8 @@ public:
     }
     std::size_t numParams() const noexcept override { return kNumParams; }
     AtomicParam& param(std::size_t i) noexcept override { return p_[i < kNumParams ? i : 0]; }
+    static FilterType bandType(std::size_t b) noexcept { return kTypes[b < kBands ? b : 0]; }
+    static float defaultFreq(std::size_t b) noexcept { constexpr float f[kBands] = {30, 100, 400, 2500, 10000, 20000}; return f[b < kBands ? b : 0]; }
 
 private:
     static constexpr FilterType kTypes[kBands] = {FilterType::HighPass, FilterType::LowShelf, FilterType::Bell,
@@ -358,6 +362,8 @@ inline ProcessorRegistry makeBuiltinRegistry() {
     r.add("hc.resonance", [] { return std::unique_ptr<IProcessor>(new ResonanceProcessor()); });
     r.add("hc.transient", [] { return std::unique_ptr<IProcessor>(new TransientProcessor()); });
     r.add("hc.width", [] { return std::unique_ptr<IProcessor>(new WidthProcessor()); });
+    r.add("hc.gate", [] { return std::unique_ptr<IProcessor>(new GateProcessor()); });
+    r.add("hc.deess", [] { return std::unique_ptr<IProcessor>(new DeEsserProcessor()); });
     return r;
 }
 

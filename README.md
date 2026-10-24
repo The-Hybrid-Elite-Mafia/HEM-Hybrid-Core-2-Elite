@@ -39,6 +39,11 @@ click or drag it to move the playhead. F11 = full screen.
 | HEM RESONANCE | Dynamic harsh-resonance suppressor: Sensitivity, Frequency, Bandwidth, Reduction, Compensation, SOFT/NORMAL/FAST. The screen shows the spectrum and the live cut curve. |
 | HEM TRANSIENT | Transient designer: Attack, Sustain, Punch/Speed, Gain, Mix. Live activity screens. The LED toggles bypass. |
 | HEM MASTERING | Master bus: Width → glue (MODE: CLEAN/PUNCH/LOUD) → true-peak limiter (Ceiling, Threshold, Release). LUFS M/S and L/R true-peak meters; Integrated, Short-term, PSR, PLR, LRA. The selector and TARGET set the export loudness. |
+| Plug-in tabs | The per-stem monitors have tabs: **DESTROYER / EQ**, **RESONANCE / DE-ESSER**, **TRANSIENT / COMP / GATE**. Every stem has its own copy of all seven. Audio order: Gate → Destroyer → Resonance → EQ → De-esser → Comp → Transient. EQ is on (flat); Gate, De-esser and Comp start OFF (ON/OFF top-right of each). |
+| HEM EQ | Six bands (HPF, LOW shelf, BELL 1, BELL 2, HIGH shelf, LPF) over the stem's live spectrum. Drag a dot: left/right = frequency, up/down = boost/cut; wheel on a dot = width (Q); double-click = reset. **FIND PING**: while the ringing plays, finds the tone and cuts it with BELL 2 (−9 dB, narrow). |
+| HEM COMPRESSOR | Threshold, Ratio, Knee, Attack, Release, Makeup; in→out curve and gain-reduction bar. |
+| HEM GATE | Shuts the stem between hits: Threshold, Range, Attack, Hold, Release, Key HPF (so kick / bass bleed doesn't open it). Level bar, OPEN / SHUT light. |
+| HEM DE-ESSER | Hat tamer / de-esser: a high shelf that only comes down when the highs spike. Frequency, Threshold, Max Cut, LISTEN (hear only what's removed). |
 
 Loop: drag across the bar numbers to set the section (snaps to whole bars; Shift = free), click the bar numbers to jump; LOOP or **L** turns it on/off; with no section set it loops the whole song. The wrap is sample-exact inside the audio engine (no gap). Export always renders the whole song. Saved in the session.
 

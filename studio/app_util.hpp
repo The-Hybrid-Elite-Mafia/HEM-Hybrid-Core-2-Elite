@@ -121,6 +121,13 @@ inline std::wstring pickFolderDialog(HWND owner, const wchar_t* title) {
     return out;
 }
 
+// A finished master exported by the app ("<song> - HEM Master.wav"): the whole song, never a stem.
+inline bool isMasterFile(const std::wstring& path) {
+    std::wstring low = std::filesystem::path(path).filename().wstring();
+    for (auto& c : low) c = static_cast<wchar_t>(towlower(c));
+    return low.find(L"hem master") != std::wstring::npos;
+}
+
 // Every .wav directly inside a folder, sorted by name. Exported masters
 // ("... HEM Master ...") are skipped so a re-load never pulls the mix back in.
 inline std::vector<std::wstring> wavsInFolder(const std::wstring& dir) {

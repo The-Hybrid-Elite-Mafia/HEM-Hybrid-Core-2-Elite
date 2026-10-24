@@ -40,6 +40,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <complex>
 #include <cstdio>
 #include <memory>
 #include <string>
@@ -88,6 +89,9 @@ struct Spectrogram {
     double sr = 48000.0;
     int rowBin[kRows + 1] = {};
     float cal = 0.0f;
+    // Fine spectra (power per FFT bin): `disp` follows quickly (EQ screen), `avg` over ~1 s (ping finder).
+    std::vector<float> disp, avg;
+    int frames = 0;
 
     void prepare(double rate) {
         sr = rate; fft.prepare(kN);
@@ -100,6 +104,7 @@ struct Spectrogram {
             rowBin[r] = std::clamp(static_cast<int>(f * kN / sr), 1, kN / 2);
         }
         for (auto& c : cell) for (auto& v : c) v = -140.0f;
+        disp.assign(kN / 2 + 1, 0.0f); avg.assign(kN / 2 + 1, 0.0f); frames = 0;
         pos = since = 0; head = 0;
     }
     void feed(const float* x, std::size_t n) {
@@ -111,6 +116,12 @@ struct Spectrogram {
     void column() {
         for (int i = 0; i < kN; ++i) frame[i] = ring[(pos + i) % kN] * win[i];
         fft.forward(frame.data(), re.data(), im.data());
+        for (int k = 0; k <= kN / 2; ++k) {
+            const float pw = re[k] * re[k] + im[k] * im[k];
+            disp[k] += (pw - disp[k]) * 0.35f;
+            avg[k] += (pw - avg[k]) * 0.012f;
+        }
+        ++frames;
         float* c = cell[head];
         for (int r = 0; r < kRows; ++r) {
             float m = 0.0f;
@@ -148,6 +159,10 @@ struct Slot {
     ArtifactProcessor* ds = nullptr;
     ResonanceProcessor* rs = nullptr;
     TransientProcessor* tr = nullptr;
+    Eq6* eq = nullptr;
+    CompProcessor* comp = nullptr;
+    GateProcessor* gate = nullptr;
+    DeEsserProcessor* dess = nullptr;
     StemMeterSnapshot meter;
     float dotLevel = 0;
 };
@@ -262,6 +277,7 @@ private:
     void setSection(Sec s);
     // The desk: six monitors. focus_ = the screen filling the window (index into DK::kScreens), -1 = whole desk.
     int focus_ = -1;
+    static constexpr float kScreenBarUnits = 52.0f;   // height of the screen bar, in Overlay units
     float secScale_ = 1, secOx_ = 0, secOy_ = 0;   // the current section's transform (device = off + coord * scale)
     float hoverGlow_[DK::kNumScreens] = {};
     Rect viewRect() const;
@@ -271,6 +287,19 @@ private:
     void drawDeskChrome();    // hover / click on the desk, masks and the screen bar (after the screens)
     void drawNowPlaying();
     void drawStemPicker(int idBase, float x0, float y0, float h);
+    // Plug-in tabs on the per-stem monitors: DESTROYER | EQ, RESONANCE | DE-ESSER, TRANSIENT | COMP | GATE.
+    int screenTab_[DK::kNumScreens] = {};
+    int drawTabs(int screen, float x1, float y0, const char* const* names, int n);
+    // The four live-drawn plug-ins (panel-local: ox, oy = the panel's top-left; 719 x 455).
+    bool panelFrame(int id, float ox, float oy, const char* name, IProcessor* p);
+    float panelKnob(int id, float cx, float cy, float r, float v, float mn, float mx, Taper t, float def, bool bipolar,
+                    const char* label, const std::string& value, bool dim, Color accent = kCyan);
+    void drawEqPanel(float ox, float oy);
+    void drawCompPanel(float ox, float oy);
+    void drawGatePanel(float ox, float oy);
+    void drawDeEssPanel(float ox, float oy);
+    void findPing();
+    int eqBand_ = 3;   // EQ band the knobs edit (0 HPF, 1 LOW, 2 BELL 1, 3 BELL 2, 4 HIGH, 5 LPF)
     void toggleFullscreen();
     bool fullscreen_ = false;
     // Loop: [loopA_, loopB_) in source frames; loopB_ == 0 means "the whole song".
@@ -511,8 +540,13 @@ StripState App::stripOf(int s) const {
 ChainState App::captureStem(int s) const {
     const Slot& sl = slots_[static_cast<std::size_t>(s)];
     ChainState c;
+    // Chain order (the order the audio goes through): Gate, Destroyer, Resonance, EQ, De-esser, Comp, Transient.
+    if (sl.gate) c.push_back(captureProc(*sl.gate));
     if (sl.ds) c.push_back(captureProc(*sl.ds));
     if (sl.rs) c.push_back(captureProc(*sl.rs));
+    if (sl.eq) c.push_back(captureProc(*sl.eq));
+    if (sl.dess) c.push_back(captureProc(*sl.dess));
+    if (sl.comp) c.push_back(captureProc(*sl.comp));
     if (sl.tr) c.push_back(captureProc(*sl.tr));
     return c;
 }
@@ -528,20 +562,34 @@ ChainState App::captureMaster() const {
 void App::publishStemChain(int s, const ChainState* st) {
     auto reg = makeBuiltinRegistry();
     auto chain = std::make_unique<ProcessorChain>();
-    std::unique_ptr<IProcessor> ds, rs, tr;
+    std::unique_ptr<IProcessor> ds, rs, tr, eq, comp, gate, dess;
     if (st) for (const auto& p : *st) {
         if (p.id == "hc.artifact") ds = restoreProc(reg, p);
         else if (p.id == "hc.resonance") rs = restoreProc(reg, p);
         else if (p.id == "hc.transient") tr = restoreProc(reg, p);
+        else if (p.id == "hc.eq6") eq = restoreProc(reg, p);
+        else if (p.id == "hc.comp") comp = restoreProc(reg, p);
+        else if (p.id == "hc.gate") gate = restoreProc(reg, p);
+        else if (p.id == "hc.deess") dess = restoreProc(reg, p);
     }
     if (!ds) ds = reg.create("hc.artifact");
     if (!rs) rs = reg.create("hc.resonance");
     if (!tr) tr = reg.create("hc.transient");
+    if (!eq) eq = reg.create("hc.eq6");                                     // flat EQ = no change
+    // Gate, De-esser and Comp would change the sound at their default settings, so they start OFF.
+    if (!comp) { comp = reg.create("hc.comp"); comp->setBypassed(true); }
+    if (!gate) { gate = reg.create("hc.gate"); gate->setBypassed(true); }
+    if (!dess) { dess = reg.create("hc.deess"); dess->setBypassed(true); }
     Slot& sl = slots_[static_cast<std::size_t>(s)];
     sl.ds = static_cast<ArtifactProcessor*>(ds.get());
     sl.rs = static_cast<ResonanceProcessor*>(rs.get());
     sl.tr = static_cast<TransientProcessor*>(tr.get());
-    chain->add(std::move(ds)); chain->add(std::move(rs)); chain->add(std::move(tr));
+    sl.eq = static_cast<Eq6*>(eq.get());
+    sl.comp = static_cast<CompProcessor*>(comp.get());
+    sl.gate = static_cast<GateProcessor*>(gate.get());
+    sl.dess = static_cast<DeEsserProcessor*>(dess.get());
+    chain->add(std::move(gate)); chain->add(std::move(ds)); chain->add(std::move(rs)); chain->add(std::move(eq));
+    chain->add(std::move(dess)); chain->add(std::move(comp)); chain->add(std::move(tr));
     eng_->publishChain(static_cast<std::size_t>(s), std::move(chain));
     if (s == selected_) specFor_ = -1;
 }
@@ -649,8 +697,20 @@ std::string App::songTitle() const {
 int App::loadedCount() const { int n = 0; for (auto& s : slots_) n += s.loaded ? 1 : 0; return n; }
 std::uint64_t App::songLength() const { std::uint64_t n = 0; for (auto& s : slots_) if (s.loaded) n = std::max(n, s.audio.frames()); return n; }
 
-void App::loadFiles(const std::vector<std::wstring>& files, int slot) {
+void App::loadFiles(const std::vector<std::wstring>& filesIn, int slot) {
     if (exporting_) { toast("Wait for the export to finish"); return; }
+    // A finished master ("... HEM Master ...") is the whole song, not a stem: loading it next to the
+    // stems plays the song twice (doubled, phasey, too loud). Skip it, every way of loading.
+    std::vector<std::wstring> files;
+    std::string masters;
+    for (const auto& f : filesIn) {
+        if (isMasterFile(f)) masters += "  " + narrow(std::filesystem::path(f).filename().wstring()) + "\n";
+        else files.push_back(f);
+    }
+    if (!masters.empty())
+        MessageBoxW(hwnd_, widen("Not loaded - this is a finished master of the whole song, not a stem.\n"
+                                 "Playing it with the stems would play the song twice:\n\n" + masters).c_str(),
+                    L"Hybrid Core", MB_ICONINFORMATION);
     if (files.empty()) return;
     std::vector<int> targets;
     if (slot >= 0) targets.push_back(slot);
@@ -1102,10 +1162,12 @@ void App::setFocus(int screen) {
 void App::updateTransform() {
     const float W = static_cast<float>(gfx_.width()), H = static_cast<float>(gfx_.height());
     const Rect v = viewRect();
-    const float s = std::min(W / v.w(), H / v.h());
+    // A screen in focus sits below the screen bar (< name DESK >), so the bar never covers its controls.
+    const float bar = focus_ >= 0 ? kScreenBarUnits * W / 1438.0f : 0.0f;
+    const float s = std::min(W / v.w(), (H - bar) / v.h());
     viewScale_ = s;
     viewOffX_ = 0.5f * (W - v.w() * s) - v.x0 * s;
-    viewOffY_ = 0.5f * (H - v.h() * s) - v.y0 * s;
+    viewOffY_ = bar + 0.5f * (H - bar - v.h() * s) - v.y0 * s;
     // Glyphs are rasterised for the screen in focus (on the whole desk: at the panels' size), so the
     // text you are working with is always pixel-sharp.
     gfx_.setTextScale(s * DK::screenScale(focus_ >= 0 ? focus_ : DK::kDestroyer));
@@ -1956,23 +2018,370 @@ void App::drawNowPlaying() {
     gfx_.text(36, 450, "HYBRID CORE 2 ELITE  -  Hybrid Elite Mafia", Font::Small, Color(kDim).alpha(0.7f));
 }
 
+// ------------------------------------------------------------------ plug-in tabs + the four live-drawn plug-ins
+int App::drawTabs(int screen, float x1, float y0, const char* const* names, int n) {
+    const float h = 27, gap = 4;
+    float x = x1;
+    for (int t = n - 1; t >= 0; --t) {
+        const float w = gfx_.textWidth(names[t], Font::Small) + 26;
+        const Rect r{x - w, y0, x, y0 + h};
+        const int id = 9400 + screen * 4 + t;
+        if (button(id, r)) screenTab_[screen] = t;
+        const bool on = screenTab_[screen] == t;
+        gfx_.roundRect(r, 6, on ? Color(kCyan).alpha(0.85f) : Color(0x05080BE0));
+        gfx_.rectOutline(r, Color(kCyan).alpha(on ? 0.9f : (hotId_ == id ? 0.8f : 0.4f)), 1.5f);
+        gfx_.textIn(r, names[t], Font::Small, on ? Color(0x041016FF) : kText);
+        x = r.x0 - gap;
+    }
+    return screenTab_[screen];
+}
+
+bool App::panelFrame(int id, float ox, float oy, const char* name, IProcessor* p) {
+    const Rect r{ox + 6, oy + 34, ox + 713, oy + 449};
+    gfx_.roundRect({r.x0, r.y0 + 3, r.x1, r.y1 + 4}, 14, 0x000000B0);   // shadow
+    gfx_.roundRect(r, 14, 0x2E363EFF);                                   // bevelled edge
+    gfx_.roundRect(r.inset(2), 12, 0x12171CFF);                         // plate
+    gfx_.gradientV({r.x0 + 14, r.y0 + 3, r.x1 - 14, r.y0 + 70}, 0xFFFFFF10, 0xFFFFFF00);   // top light
+    for (float sx : {r.x0 + 16, r.x1 - 16})
+        for (float sy : {r.y0 + 16, r.y1 - 16}) {
+            gfx_.circleGradient(sx, sy, 6.5f, 0xA8B0B8FF, 0x353B41FF);
+            gfx_.line(sx - 4, sy + 1.5f, sx + 4, sy - 1.5f, 1.6f, 0x20262BFF);
+        }
+    const bool on = p && !p->bypassed();
+    const Rect title{ox + 34, oy + 44, ox + 560, oy + 80};
+    gfx_.text(title.x0, title.y0, "HEM", Font::Large, kText);
+    gfx_.text(title.x0 + gfx_.textWidth("HEM ", Font::Large), title.y0, name, Font::Large, kCyan);
+    const Rect pw{ox + 606, oy + 46, ox + 692, oy + 76};
+    if (p && (button(id, pw) || button(id + 1, title))) p->setBypassed(on);
+    gfx_.roundRect(pw, 6, on ? Color(kCyan).alpha(0.85f) : Color(0x05080BE0));
+    gfx_.rectOutline(pw, Color(kCyan).alpha(hotId_ == id ? 0.9f : 0.5f), 1.5f);
+    gfx_.textIn(pw, on ? "ON" : "OFF", Font::Small, on ? Color(0x041016FF) : kDim);
+    if (hotId_ == id || hotId_ == id + 1) { tooltip_ = on ? "Turn this plug-in off (bypass)" : "Turn this plug-in on"; tipX_ = pw.cx(); tipY_ = pw.y0 - 4; tipSec_ = curSec_; }
+    return on;
+}
+
+float App::panelKnob(int id, float cx, float cy, float r, float v, float mn, float mx, Taper t, float def, bool bipolar,
+                     const char* label, const std::string& value, bool dim, Color accent) {
+    gfx_.textIn({cx - 75, cy - r - 28, cx + 75, cy - r - 6}, label, Font::Small, dim ? kDim : kText);
+    const float nv = knob(id, LY::Knob{cx, cy, r}, v, mn, mx, t, def, bipolar, accent, std::string(label) + "  " + value, dim);
+    gfx_.textIn({cx - 75, cy + r + 2, cx + 75, cy + r + 26}, value, Font::Normal, dim ? kDim : accent);
+    return nv;
+}
+
+// EQ: six bands on the selected stem. Drag a dot (left/right = frequency, up/down = boost/cut),
+// mouse wheel on a dot = width (Q), double-click a dot = reset that band. FIND PING hunts the ringing tone.
+void App::drawEqPanel(float ox, float oy) {
+    Eq6* eq = sel().eq;
+    if (!eq) return;
+    const bool on = panelFrame(700, ox, oy, "EQ", eq);
+    const bool dim = !on;
+    const Rect d{ox + 24, oy + 86, ox + 695, oy + 262};
+    gfx_.rect(d, 0x05080BFF);
+    gfx_.rectOutline(d, Color(kCyan).alpha(0.2f), 1.2f);
+    auto xOf = [&](double f) { return d.x0 + static_cast<float>(std::log(f / 20.0) / std::log(1000.0)) * d.w(); };
+    auto fOf = [&](float x) { return 20.0 * std::pow(1000.0, static_cast<double>((x - d.x0) / d.w())); };
+    const float half = d.h() * 0.5f - 10;
+    auto yOf = [&](float db) { return d.cy() - clampf(db, -24, 24) / 24.0f * half; };
+    for (double f : {50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0}) {
+        gfx_.line(xOf(f), d.y0, xOf(f), d.y1, 1.0f, 0x15222BFF);
+        gfx_.text(xOf(f) + 3, d.y1 - 18, f >= 1000 ? fmt("%.0fk", f / 1000) : fmt("%.0f", f), Font::Small, Color(kDim).alpha(0.8f));
+    }
+    for (float db : {-12.0f, 0.0f, 12.0f}) {
+        gfx_.line(d.x0, yOf(db), d.x1, yOf(db), 1.0f, db == 0 ? Color(0x2A3C48FF) : Color(0x15222BFF));
+        gfx_.text(d.x0 + 4, yOf(db) - 17, fmt("%+.0f", db), Font::Small, Color(kDim).alpha(0.7f));
+    }
+    // The stem's live spectrum underneath (what's coming out of this stem's plug-ins).
+    if (spec_.disp.size() == Spectrogram::kN / 2 + 1 && spec_.frames > 0) {
+        constexpr int kPts = 180;
+        float pts[2 * kPts];
+        for (int i = 0; i < kPts; ++i) {
+            const float x = d.x0 + d.w() * static_cast<float>(i) / (kPts - 1);
+            const double f0 = fOf(x - d.w() / (2 * kPts)), f1 = fOf(x + d.w() / (2 * kPts));
+            const int k0 = std::clamp(static_cast<int>(f0 * Spectrogram::kN / sr_), 1, Spectrogram::kN / 2);
+            const int k1 = std::clamp(static_cast<int>(f1 * Spectrogram::kN / sr_), k0, Spectrogram::kN / 2);
+            float pw = 0;
+            for (int k = k0; k <= k1; ++k) pw = std::max(pw, spec_.disp[static_cast<std::size_t>(k)]);
+            const float db = 10.0f * std::log10(pw + 1e-20f) + spec_.cal;
+            pts[2 * i] = x;
+            pts[2 * i + 1] = d.y1 - clampf((db + 100.0f) / 100.0f, 0, 1) * (d.h() - 4);
+        }
+        gfx_.fillUnder(pts, kPts, d.y1, Color(kCyan).alpha(dim ? 0.08f : 0.22f), Color(kCyan).alpha(0.02f));
+    }
+    // The EQ curve (sum of the active bands).
+    {
+        constexpr int kPts = 240;
+        float pts[2 * kPts];
+        BiquadCoeffs c[Eq6::kBands];
+        bool act[Eq6::kBands];
+        for (std::size_t b = 0; b < Eq6::kBands; ++b) {
+            const FilterType ft = Eq6::bandType(b);
+            const float fr = eq->param(3 * b).target(), gn = eq->param(3 * b + 1).target(), q = eq->param(3 * b + 2).target();
+            c[b] = designBiquad(ft, sr_, fr, q, gn);
+            const bool pass = ft == FilterType::HighPass || ft == FilterType::LowPass;
+            act[b] = pass ? (ft == FilterType::HighPass ? fr > 20.5f : fr < 19999.0f) : std::fabs(gn) > 0.01f;
+        }
+        const float outDb = eq->param(18).target();
+        for (int i = 0; i < kPts; ++i) {
+            const float x = d.x0 + d.w() * static_cast<float>(i) / (kPts - 1);
+            const double w = 2.0 * 3.14159265358979 * fOf(x) / sr_;
+            double db = outDb;
+            for (std::size_t b = 0; b < Eq6::kBands; ++b) {
+                if (!act[b]) continue;
+                const std::complex<double> z1 = std::polar(1.0, -w), z2 = std::polar(1.0, -2.0 * w);
+                const std::complex<double> num = c[b].b0 + c[b].b1 * z1 + c[b].b2 * z2;
+                const std::complex<double> den = 1.0 + c[b].a1 * z1 + c[b].a2 * z2;
+                db += 20.0 * std::log10(std::abs(num / den) + 1e-12);
+            }
+            pts[2 * i] = x;
+            pts[2 * i + 1] = yOf(static_cast<float>(db));
+        }
+        gfx_.polyline(pts, kPts, 2.5f, dim ? Color(kDim) : kCyan);
+    }
+    // Band dots.
+    static const Color bandCol[Eq6::kBands] = {0x9AA6B0FF, 0x5BE37AFF, 0xE8C547FF, 0xFF9A3EFF, 0xC27BFFFF, 0x9AA6B0FF};
+    for (std::size_t b = 0; b < Eq6::kBands; ++b) {
+        const FilterType ft = Eq6::bandType(b);
+        const bool pass = ft == FilterType::HighPass || ft == FilterType::LowPass;
+        AtomicParam& pf = eq->param(3 * b);
+        AtomicParam& pg = eq->param(3 * b + 1);
+        AtomicParam& pq = eq->param(3 * b + 2);
+        const float x = xOf(pf.target()), y = pass ? d.cy() : yOf(pg.target());
+        const int id = 720 + static_cast<int>(b);
+        const bool hot = std::hypot(in_.mx - x, in_.my - y) < 15.0f;
+        if (hot) {
+            hotId_ = id;
+            tooltip_ = std::string(b == 0 ? "HPF" : b == 1 ? "LOW" : b == 2 ? "BELL 1" : b == 3 ? "BELL 2" : b == 4 ? "HIGH" : "LPF") +
+                       fmt("  %.0f Hz", pf.target()) + (pass ? std::string() : fmt("  %+.1f dB", pg.target())) + fmt("  Q %.2f  (wheel = width)", pq.target());
+            tipX_ = x; tipY_ = y - 16; tipSec_ = curSec_;
+            if (in_.dbl) { pf.set(Eq6::defaultFreq(b)); pg.set(0); pq.set(0.707f); activeId_ = 0; }
+            else if (in_.pressed) { activeId_ = id; eqBand_ = static_cast<int>(b); }
+            if (in_.wheel != 0) pq.set(clampf(pq.target() * std::pow(1.15f, in_.wheel), 0.1f, 18.0f));
+        }
+        if (activeId_ == id) {
+            if (in_.down) {
+                pf.set(static_cast<float>(std::clamp(fOf(in_.mx), 20.0, 22000.0)));
+                if (!pass) pg.set(clampf((d.cy() - in_.my) / half * 24.0f, -24, 24));
+            }
+            if (in_.released) activeId_ = 0;
+        }
+        const bool selB = eqBand_ == static_cast<int>(b);
+        gfx_.circle(x, y, selB ? 11.0f : 9.0f, 0x000000FF);
+        gfx_.circle(x, y, selB ? 9.0f : 7.0f, dim ? Color(kDim) : bandCol[b]);
+        if (selB || hot) gfx_.ring(x, y, 14.0f, 1.5f, Color(0xFFFFFFFF).alpha(0.7f));
+    }
+    // Band buttons + FIND PING.
+    static const char* bnames[Eq6::kBands] = {"HPF", "LOW", "BELL 1", "BELL 2", "HIGH", "LPF"};
+    const float bw = 82, by0 = oy + 270, by1 = oy + 296;
+    for (int b = 0; b < static_cast<int>(Eq6::kBands); ++b) {
+        const Rect r{ox + 24 + b * (bw + 4), by0, ox + 24 + b * (bw + 4) + bw, by1};
+        if (button(740 + b, r)) eqBand_ = b;
+        const bool sb = eqBand_ == b;
+        gfx_.roundRect(r, 5, sb ? bandCol[b].alpha(0.85f) : Color(0x05080BE0));
+        gfx_.rectOutline(r, bandCol[b].alpha(hotId_ == 740 + b ? 0.9f : 0.45f), 1.2f);
+        gfx_.textIn(r, bnames[b], Font::Small, sb ? Color(0x041016FF) : kText);
+    }
+    const Rect ping{ox + 24 + 6 * (bw + 4) + 6, by0, ox + 695, by1};
+    if (button(750, ping)) findPing();
+    gfx_.roundRect(ping, 5, Color(kOrange).alpha(hotId_ == 750 ? 0.9f : 0.7f));
+    gfx_.textIn(ping, "FIND PING", Font::Small, 0x140800FF);
+    if (hotId_ == 750) { tooltip_ = "Play the part where it rings, then click: finds the ringing tone and cuts it with BELL 2"; tipX_ = ping.cx(); tipY_ = ping.y0 - 4; tipSec_ = curSec_; }
+    // Knobs for the selected band + output.
+    const std::size_t b = static_cast<std::size_t>(std::clamp(eqBand_, 0, 5));
+    const bool pass = b == 0 || b == 5;
+    AtomicParam& pf = eq->param(3 * b);
+    AtomicParam& pg = eq->param(3 * b + 1);
+    AtomicParam& pq = eq->param(3 * b + 2);
+    AtomicParam& po = eq->param(18);
+    const float ky = oy + 368, kr = 40;
+    pf.set(panelKnob(760, ox + 110, ky, kr, pf.target(), 20, 22000, Taper::Log, Eq6::defaultFreq(b), false, "FREQUENCY",
+                     pf.target() >= 1000 ? fmt("%.2f kHz", pf.target() / 1000) : fmt("%.0f Hz", pf.target()), dim, bandCol[b]));
+    if (!pass) pg.set(panelKnob(761, ox + 265, ky, kr, pg.target(), -24, 24, Taper::Linear, 0, true, "BOOST / CUT", fmt("%+.1f dB", pg.target()), dim, bandCol[b]));
+    else gfx_.textIn({ox + 190, ky - 20, ox + 340, ky + 20}, b == 0 ? "cuts the lows" : "cuts the highs", Font::Small, kDim);
+    pq.set(panelKnob(762, ox + 420, ky, kr, pq.target(), 0.1f, 18, Taper::Log, 0.707f, false, pass ? "SLOPE (Q)" : "WIDTH (Q)",
+                     fmt("%.2f", pq.target()), dim, bandCol[b]));
+    po.set(panelKnob(763, ox + 600, ky, kr, po.target(), -24, 24, Taper::Linear, 0, true, "OUTPUT", fmt("%+.1f dB", po.target()), dim));
+}
+
+void App::findPing() {
+    Eq6* eq = sel().eq;
+    if (!eq) return;
+    if (!eng_->isPlaying() || spec_.frames < 40 || spec_.avg.size() != Spectrogram::kN / 2 + 1) {
+        toast("Play the part with the ping first, then click FIND PING while it rings");
+        return;
+    }
+    const int N = Spectrogram::kN;
+    std::vector<float> db(static_cast<std::size_t>(N / 2 + 1));
+    float maxDb = -200.0f;
+    for (int k = 1; k <= N / 2; ++k) {
+        db[static_cast<std::size_t>(k)] = 10.0f * std::log10(spec_.avg[static_cast<std::size_t>(k)] + 1e-20f);
+        maxDb = std::max(maxDb, db[static_cast<std::size_t>(k)]);
+    }
+    int best = -1;
+    float bestScore = 0.0f;
+    std::vector<float> nb;
+    for (int k = 2; k < N / 2 - 1; ++k) {
+        const double f = static_cast<double>(k) * sr_ / N;
+        if (f < 150.0 || f > 12000.0) continue;
+        const float v = db[static_cast<std::size_t>(k)];
+        if (v < maxDb - 45.0f || v < db[static_cast<std::size_t>(k - 1)] || v < db[static_cast<std::size_t>(k + 1)]) continue;
+        // Compare with its neighbourhood (±1/6 octave, not counting the peak itself).
+        const int lo = std::max(1, static_cast<int>(k / 1.1225)), hi = std::min(N / 2, static_cast<int>(k * 1.1225) + 1);
+        nb.clear();
+        for (int j = lo; j <= hi; ++j) if (std::abs(j - k) > 1) nb.push_back(db[static_cast<std::size_t>(j)]);
+        if (nb.size() < 4) continue;
+        std::nth_element(nb.begin(), nb.begin() + static_cast<std::ptrdiff_t>(nb.size() / 2), nb.end());
+        const float score = v - nb[nb.size() / 2];
+        if (score > bestScore) { bestScore = score; best = k; }
+    }
+    if (best < 0 || bestScore < 6.0f) { toast("No clear ping found - click FIND PING while the ringing is sounding"); return; }
+    // Parabolic interpolation between bins for the exact pitch.
+    const float a = db[static_cast<std::size_t>(best - 1)], bb = db[static_cast<std::size_t>(best)], c = db[static_cast<std::size_t>(best + 1)];
+    const float den = a - 2 * bb + c;
+    const float off = std::fabs(den) > 1e-6f ? 0.5f * (a - c) / den : 0.0f;
+    const float f = static_cast<float>((best + clampf(off, -0.5f, 0.5f)) * sr_ / N);
+    eq->param(3 * 3).set(f);
+    eq->param(3 * 3 + 1).set(-9.0f);
+    eq->param(3 * 3 + 2).set(8.0f);
+    eq->setBypassed(false);
+    eqBand_ = 3;
+    toast(f >= 1000 ? fmt("Found a ping at %.2f kHz", f / 1000) + " - BELL 2 now cuts it 9 dB (drag the orange dot to fine-tune)"
+                    : fmt("Found a ping at %.0f Hz", f) + " - BELL 2 now cuts it 9 dB (drag the orange dot to fine-tune)");
+}
+
+// COMPRESSOR: evens out loud and soft. Left: what it does to the level (in → out); the bar = how much it's pulling down now.
+void App::drawCompPanel(float ox, float oy) {
+    CompProcessor* c = sel().comp;
+    if (!c) return;
+    const bool on = panelFrame(800, ox, oy, "COMPRESSOR", c);
+    const bool dim = !on;
+    AtomicParam& th = c->param(CompProcessor::kThresh);
+    AtomicParam& ra = c->param(CompProcessor::kRatio);
+    AtomicParam& kn = c->param(CompProcessor::kKnee);
+    AtomicParam& at = c->param(CompProcessor::kAttack);
+    AtomicParam& re = c->param(CompProcessor::kRelease);
+    AtomicParam& mk = c->param(CompProcessor::kMakeup);
+    const Rect g{ox + 24, oy + 92, ox + 254, oy + 322};
+    gfx_.rect(g, 0x05080BFF);
+    gfx_.rectOutline(g, Color(kCyan).alpha(0.2f), 1.2f);
+    auto gx = [&](float db) { return g.x0 + (db + 60.0f) / 60.0f * g.w(); };
+    auto gy = [&](float db) { return g.y1 - clampf((db + 60.0f) / 60.0f, 0, 1) * g.h(); };
+    gfx_.line(gx(-60), gy(-60), gx(0), gy(0), 1.0f, 0x2A3C48FF);   // 1:1
+    float pts[2 * 61];
+    const float T = th.target(), R = ra.target(), W = kn.target(), slope = 1.0f / R - 1.0f;
+    for (int i = 0; i <= 60; ++i) {
+        const float x = -60.0f + static_cast<float>(i);
+        const float dlt = x - T;
+        float gr = 0.0f;
+        if (2.0f * dlt >= -W) gr = (W > 0.0f && 2.0f * std::fabs(dlt) <= W) ? slope * (dlt + 0.5f * W) * (dlt + 0.5f * W) / (2.0f * W) : slope * dlt;
+        pts[2 * i] = gx(x);
+        pts[2 * i + 1] = gy(x + gr + mk.target());
+    }
+    gfx_.polyline(pts, 61, 2.5f, dim ? Color(kDim) : kCyan);
+    gfx_.line(gx(T), g.y0, gx(T), g.y1, 1.0f, Color(kOrange).alpha(0.6f));
+    gfx_.text(g.x0 + 6, g.y0 + 4, "IN -> OUT", Font::Small, kDim);
+    // Gain-reduction bar.
+    const float gr = on ? -c->meterValue() : 0.0f;
+    const Rect mb{ox + 268, oy + 92, ox + 298, oy + 322};
+    gfx_.rect(mb, 0x05080BFF);
+    gfx_.rect({mb.x0 + 3, mb.y0 + 3, mb.x1 - 3, mb.y0 + 3 + clampf(gr / 24.0f, 0, 1) * (mb.h() - 6)}, kOrange);
+    gfx_.textIn({ox + 240, oy + 326, ox + 330, oy + 350}, fmt("-%.1f dB", gr), Font::Small, kOrange);
+    // Knobs.
+    const float kr = 38, c1 = ox + 410, c2 = ox + 530, c3 = ox + 650, r1 = oy + 170, r2 = oy + 330;
+    th.set(panelKnob(810, c1, r1, kr, th.target(), -60, 0, Taper::Linear, -18, false, "THRESHOLD", fmt("%.1f dB", th.target()), dim));
+    ra.set(panelKnob(811, c2, r1, kr, ra.target(), 1, 20, Taper::Log, 3, false, "RATIO", fmt("%.1f : 1", ra.target()), dim));
+    kn.set(panelKnob(812, c3, r1, kr, kn.target(), 0, 24, Taper::Linear, 6, false, "KNEE", fmt("%.1f dB", kn.target()), dim));
+    at.set(panelKnob(813, c1, r2, kr, at.target(), 0.05f, 200, Taper::Log, 10, false, "ATTACK", fmt("%.1f ms", at.target()), dim));
+    re.set(panelKnob(814, c2, r2, kr, re.target(), 5, 2000, Taper::Log, 120, false, "RELEASE", fmt("%.0f ms", re.target()), dim));
+    mk.set(panelKnob(815, c3, r2, kr, mk.target(), -12, 24, Taper::Linear, 0, true, "MAKEUP", fmt("%+.1f dB", mk.target()), dim));
+}
+
+// GATE: shuts the stem between hits. The bar is the stem's level; above the cyan line the gate opens.
+void App::drawGatePanel(float ox, float oy) {
+    GateProcessor* g = sel().gate;
+    if (!g) return;
+    const bool on = panelFrame(850, ox, oy, "GATE", g);
+    const bool dim = !on;
+    AtomicParam& th = g->param(GateProcessor::kThresh);
+    AtomicParam& rg = g->param(GateProcessor::kRange);
+    AtomicParam& at = g->param(GateProcessor::kAttack);
+    AtomicParam& ho = g->param(GateProcessor::kHold);
+    AtomicParam& re = g->param(GateProcessor::kRelease);
+    AtomicParam& kh = g->param(GateProcessor::kKeyHpf);
+    const Rect m{ox + 24, oy + 96, ox + 560, oy + 134};
+    gfx_.rect(m, 0x05080BFF);
+    gfx_.rectOutline(m, Color(kCyan).alpha(0.2f), 1.2f);
+    auto mx = [&](float db) { return m.x0 + clampf((db + 80.0f) / 80.0f, 0, 1) * m.w(); };
+    const float lv = on ? g->keyLevelDb() : -120.0f;
+    gfx_.rect({m.x0 + 2, m.y0 + 4, mx(lv), m.y1 - 4}, lv > th.target() ? kGreen : Color(0x2E6A84FF));
+    gfx_.line(mx(th.target()), m.y0 - 6, mx(th.target()), m.y1 + 6, 3.0f, kCyan);
+    gfx_.line(mx(th.target() - GateProcessor::kHysteresisDb), m.y0, mx(th.target() - GateProcessor::kHysteresisDb), m.y1, 1.0f, Color(kCyan).alpha(0.4f));
+    for (float db : {-60.0f, -40.0f, -20.0f, 0.0f}) gfx_.text(mx(db) - 10, m.y1 + 4, fmt("%.0f", db), Font::Small, kDim);
+    const bool open = on && g->isOpen();
+    const Rect led{ox + 580, oy + 94, ox + 695, oy + 136};
+    gfx_.roundRect(led, 8, open ? Color(kGreen).alpha(0.85f) : Color(0x3A1414FF));
+    gfx_.textIn(led, !on ? "OFF" : (open ? "OPEN" : "SHUT"), Font::Normal, open ? Color(0x062010FF) : Color(0xFF6A6AFF));
+    const float kr = 36, ky = oy + 262;
+    const float xs[6] = {ox + 75, ox + 188, ox + 301, ox + 414, ox + 527, ox + 640};
+    th.set(panelKnob(860, xs[0], ky, kr, th.target(), -80, 0, Taper::Linear, -40, false, "THRESHOLD", fmt("%.1f dB", th.target()), dim));
+    rg.set(panelKnob(861, xs[1], ky, kr, rg.target(), -80, 0, Taper::Linear, -60, false, "RANGE", fmt("%.0f dB", rg.target()), dim));
+    at.set(panelKnob(862, xs[2], ky, kr, at.target(), 0.05f, 50, Taper::Log, 0.5f, false, "ATTACK", fmt("%.2f ms", at.target()), dim));
+    ho.set(panelKnob(863, xs[3], ky, kr, ho.target(), 0, 500, Taper::Linear, 40, false, "HOLD", fmt("%.0f ms", ho.target()), dim));
+    re.set(panelKnob(864, xs[4], ky, kr, re.target(), 5, 2000, Taper::Log, 120, false, "RELEASE", fmt("%.0f ms", re.target()), dim));
+    kh.set(panelKnob(865, xs[5], ky, kr, kh.target(), 20, 2000, Taper::Log, 20, false, "KEY HPF", fmt("%.0f Hz", kh.target()), dim));
+    gfx_.textIn({ox + 24, oy + 345, ox + 695, oy + 370}, "Set THRESHOLD just under the hits. RANGE = how far it shuts.", Font::Small, kDim);
+    gfx_.textIn({ox + 24, oy + 372, ox + 695, oy + 397}, "KEY HPF up = the gate ignores kick / bass bleed when it decides.", Font::Small, kDim);
+}
+
+// DE-ESSER / HAT TAMER: turns down harsh highs only when they spike.
+void App::drawDeEssPanel(float ox, float oy) {
+    DeEsserProcessor* d = sel().dess;
+    if (!d) return;
+    const bool on = panelFrame(900, ox, oy, "DE-ESSER", d);
+    const bool dim = !on;
+    AtomicParam& fr = d->param(DeEsserProcessor::kFreq);
+    AtomicParam& th = d->param(DeEsserProcessor::kThresh);
+    AtomicParam& mc = d->param(DeEsserProcessor::kMaxCut);
+    AtomicParam& li = d->param(DeEsserProcessor::kListen);
+    const float cut = on ? -d->meterValue() : 0.0f;
+    const Rect m{ox + 24, oy + 96, ox + 695, oy + 132};
+    gfx_.rect(m, 0x05080BFF);
+    gfx_.rectOutline(m, Color(kOrange).alpha(0.25f), 1.2f);
+    gfx_.rect({m.x0 + 2, m.y0 + 4, m.x0 + 2 + clampf(cut / 24.0f, 0, 1) * (m.w() - 4), m.y1 - 4}, kOrange);
+    gfx_.textIn({ox + 24, oy + 136, ox + 695, oy + 160}, on ? fmt("cutting %.1f dB", cut) : std::string("off"), Font::Small, kOrange);
+    const float kr = 44, ky = oy + 262;
+    fr.set(panelKnob(910, ox + 120, ky, kr, fr.target(), 2000, 16000, Taper::Log, 6500, false, "FREQUENCY", fmt("%.1f kHz", fr.target() / 1000), dim, kOrange));
+    th.set(panelKnob(911, ox + 290, ky, kr, th.target(), -60, 0, Taper::Linear, -24, false, "THRESHOLD", fmt("%.1f dB", th.target()), dim, kOrange));
+    mc.set(panelKnob(912, ox + 460, ky, kr, mc.target(), 0, 24, Taper::Linear, 12, false, "MAX CUT", fmt("%.1f dB", mc.target()), dim, kOrange));
+    const bool listen = li.target() > 0.5f;
+    const Rect lb{ox + 580, ky - 24, ox + 690, ky + 24};
+    if (button(915, lb)) li.set(listen ? 0.0f : 1.0f);
+    gfx_.roundRect(lb, 8, listen ? Color(kOrange).alpha(0.9f) : Color(0x05080BE0));
+    gfx_.rectOutline(lb, Color(kOrange).alpha(hotId_ == 915 ? 0.9f : 0.5f), 1.5f);
+    gfx_.textIn(lb, "LISTEN", Font::Small, listen ? Color(0x140800FF) : kText);
+    if (hotId_ == 915) { tooltip_ = "Hear only what's being cut (turn it back off when you're done)"; tipX_ = lb.cx(); tipY_ = lb.y0 - 4; tipSec_ = curSec_; }
+    gfx_.textIn({ox + 24, oy + 345, ox + 695, oy + 370}, "Hi-hats / cymbals: FREQUENCY 7-10 kHz.  Vocal \"sss\": 5-8 kHz.", Font::Small, kDim);
+    gfx_.textIn({ox + 24, oy + 372, ox + 695, oy + 397}, "Lower THRESHOLD = cuts more often. MAX CUT = the most it ever turns down.", Font::Small, kDim);
+}
+
 // ====================================================================================== the desk
 void App::drawDesk() {
     setSection(Sec::Canvas);
     gfx_.image(0, {0, 0, DK::kDeskTexW, DK::kDeskTexH}, {0, 0, DK::kDeskW, DK::kDeskH});
-    // Each monitor's glass: a dark screen, so a screen's content can sit letterboxed inside it.
-    for (int i = 0; i < DK::kNumScreens; ++i) gfx_.rect(DK::kScreens[i].glass, 0x05070AFF);
+    // (The monitors' glass is already black in the art; shapes are always drawn over images, so no
+    // fill here — it would cover the faceplate art.)
 }
 
 void App::drawScreen(int i) {
     static const Sec secs[DK::kNumScreens] = {Sec::Destroyer, Sec::NowPlaying, Sec::Resonance, Sec::Transient, Sec::Console, Sec::Mastering};
     const DK::Screen& sc = DK::kScreens[i];
     setSection(secs[i]);
-    if (sc.skin.w() > 0) gfx_.image(1, sc.skin, sc.src);
+    const int tab = screenTab_[i];
+    if (sc.skin.w() > 0 && tab == 0) gfx_.image(1, sc.skin, sc.src);
+    const float ox = sc.src.x0, oy = sc.src.y0;
     switch (i) {
-    case DK::kDestroyer: drawDestroyer(); break;
-    case DK::kResonance: drawResonance(); break;
-    case DK::kTransient: drawTransient(); break;
+    case DK::kDestroyer: if (tab == 0) drawDestroyer(); else drawEqPanel(ox, oy); break;
+    case DK::kResonance: if (tab == 0) drawResonance(); else drawDeEssPanel(ox, oy); break;
+    case DK::kTransient: if (tab == 0) drawTransient(); else if (tab == 1) drawCompPanel(ox, oy); else drawGatePanel(ox, oy); break;
     case DK::kMastering: drawMastering(); break;
     case DK::kConsole: drawTransport(); drawArrange(); break;
     case DK::kNowPlaying: drawNowPlaying(); break;
@@ -1982,6 +2391,12 @@ void App::drawScreen(int i) {
     if (i == DK::kDestroyer || i == DK::kResonance || i == DK::kTransient) {
         setSection(secs[i]);
         drawStemPicker(9100 + 10 * i, sc.src.x0 + 12, sc.src.y0 + 3, 27);
+        static const char* t0[] = {"DESTROYER", "EQ"};
+        static const char* t2[] = {"RESONANCE", "DE-ESSER"};
+        static const char* t3[] = {"TRANSIENT", "COMP", "GATE"};
+        if (i == DK::kDestroyer) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t0, 2);
+        else if (i == DK::kResonance) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t2, 2);
+        else drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t3, 3);
     }
 }
 
