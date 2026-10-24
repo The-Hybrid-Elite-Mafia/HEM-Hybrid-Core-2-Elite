@@ -5,6 +5,7 @@
 //    hc.artifact  HF Artifact Destroyer (STFT, see repair/artifact_engine.hpp)
 //    hc.limiter   true-peak lookahead brick-wall limiter (master)
 //    hc.gate, hc.deess — see stem_tools.hpp
+//    hc.everyhit  EVERY HIT tamer (cuts every hit relative to the running floor) — see every_hit.hpp
 // =============================================================================
 #pragma once
 #include "hc/dsp/biquad.hpp"
@@ -15,6 +16,7 @@
 #include "hc/repair/resonance.hpp"
 #include "hc/dsp/transient.hpp"
 #include "hc/engine/stem_tools.hpp"
+#include "hc/engine/every_hit.hpp"
 #include <array>
 
 namespace hc {
@@ -364,6 +366,7 @@ inline ProcessorRegistry makeBuiltinRegistry() {
     r.add("hc.width", [] { return std::unique_ptr<IProcessor>(new WidthProcessor()); });
     r.add("hc.gate", [] { return std::unique_ptr<IProcessor>(new GateProcessor()); });
     r.add("hc.deess", [] { return std::unique_ptr<IProcessor>(new DeEsserProcessor()); });
+    r.add("hc.everyhit", [] { return std::unique_ptr<IProcessor>(new EveryHitProcessor()); });
     return r;
 }
 

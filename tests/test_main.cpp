@@ -470,6 +470,95 @@ static void testDeEsser() {
     check(cut4 > 3.0f, "De-esser: 5 ms burst caught by the held cut meter (dB)", cut4, "dB");
 }
 
+static void testEveryHit() {
+    // Song-like test signal: a 200 Hz body at 0.1 (-20 dBFS) the whole time, and 9 kHz bursts of 150 ms every
+    // 600 ms that alternate QUIET (-50 dBFS peak) and LOUD (-15 dBFS peak). 8 hits in 4.8 s.
+    const double sr = 48000; const std::size_t n = std::size_t(sr * 4.8);
+    const std::size_t period = 28800, burst = 7200, start = 9600;   // 600 ms, 150 ms, first hit at 0.2 s
+    const float quiet = simd::db_to_gain(-50.0f), loud = simd::db_to_gain(-15.0f);
+    std::vector<float> in(n);
+    for (std::size_t i = 0; i < n; ++i)   // the body fades in over 50 ms so the song's start isn't itself a click/hit
+        in[i] = std::min(1.0f, float(i) / 2400.0f) * 0.1f * std::sin(float(2 * kPi * 200.0 * double(i) / sr));
+    for (std::size_t h = 0; h < 8; ++h) {
+        const float a = (h & 1) ? loud : quiet;
+        for (std::size_t i = start + h * period; i < start + h * period + burst; ++i) in[i] += a * std::sin(float(2 * kPi * 9000.0 * double(i) / sr));
+    }
+    EveryHitProcessor e;   // defaults: 7 kHz, AMOUNT 8, SENSITIVITY 9, RELEASE 80
+    e.prepare(sr, 256);
+    std::vector<float> L = in, R = in;
+    long allocs = -1;
+    runStereo(e, L, R, 256, &allocs);
+    // Cut of each burst, measured over its middle 100 ms (the first 25 ms are left to the attack).
+    double cutQ[4], cutL[4], minQ = 1e9, maxQ = -1e9, minL = 1e9, maxL = -1e9;
+    for (std::size_t h = 0; h < 8; ++h) {
+        const std::size_t a = start + h * period + 1200, b = a + 4800;
+        const double cut = toneDb(in, a, b, 9000, sr) - toneDb(L, a, b, 9000, sr);
+        if (h & 1) { cutL[h / 2] = cut; minL = std::min(minL, cut); maxL = std::max(maxL, cut); }
+        else       { cutQ[h / 2] = cut; minQ = std::min(minQ, cut); maxQ = std::max(maxQ, cut); }
+    }
+    const double spread = std::max(maxQ, maxL) - std::min(minQ, minL);
+    check(minQ > 3.0, "EVERY HIT: quiet -50 dB hits are cut (smallest cut, dB)", minQ, "dB");
+    check(minL > 3.0, "EVERY HIT: loud -15 dB hits are cut (smallest cut, dB)", minL, "dB");
+    check(spread < 1.5, "EVERY HIT: quiet and loud hits cut by the same amount (spread, dB)", spread, "dB");
+    check(std::fabs(cutQ[0] - cutL[3]) < 1.5, "EVERY HIT: first quiet hit vs last loud hit (difference, dB)", std::fabs(cutQ[0] - cutL[3]), "dB");
+    // The 200 Hz body under the hits is unchanged.
+    double worst200 = 0;
+    for (std::size_t h = 0; h < 8; ++h) {
+        const std::size_t a = start + h * period + 1200, b = a + 4800;
+        worst200 = std::max(worst200, std::fabs(toneDb(L, a, b, 200, sr) - toneDb(in, a, b, 200, sr)));
+    }
+    check(worst200 < 0.5, "EVERY HIT: 200 Hz body under the hits unchanged (worst level change)", worst200, "dB");
+    // Between the hits (last 300 ms of each gap, the cut has released) the output is exactly the input.
+    double errGap = 0;
+    for (std::size_t h = 1; h < 8; ++h)
+        for (std::size_t i = start + h * period - 14400; i < start + h * period; ++i) errGap = std::max(errGap, double(std::fabs(L[i] - in[i])));
+    check(errGap == 0.0, "EVERY HIT: between hits the output equals the input exactly (max error)", errGap);
+    check(allocs == 0, "EVERY HIT: no memory allocation while processing", double(allocs));
+    const std::uint32_t hc8 = e.takeHitCount();
+    check(hc8 == 8, "EVERY HIT: hit counter = 8 hits", double(hc8), "hits");
+    check(e.takeHitCount() == 0, "EVERY HIT: reading the hit counter resets it", 0.0, "hits");
+    const float cutMeter = e.takeCutPeakDb();
+    check(cutMeter > 7.9f && cutMeter <= 8.01f, "EVERY HIT: cut meter holds the biggest cut (AMOUNT 8)", cutMeter, "dB");
+
+    // A steady 9 kHz tone (no hits) is NOT cut. Its start is one hit (jump from silence), then the floor
+    // catches up; measured from 1 s on.
+    const std::size_t n2 = std::size_t(sr * 5);
+    std::vector<float> tone(n2);
+    for (std::size_t i = 0; i < n2; ++i) tone[i] = 0.3f * std::sin(float(2 * kPi * 9000.0 * double(i) / sr));
+    EveryHitProcessor e2; e2.prepare(sr, 256);
+    std::vector<float> L2 = tone, R2 = tone;
+    runStereo(e2, L2, R2, 256, nullptr);
+    const double steadyCut = toneDb(tone, 48000, n2, 9000, sr) - toneDb(L2, 48000, n2, 9000, sr);
+    check(std::fabs(steadyCut) < 0.05, "EVERY HIT: steady 9 kHz tone not cut (level change from 1 s on)", steadyCut, "dB");
+    double errTone = 0; for (std::size_t i = 96000; i < n2; ++i) errTone = std::max(errTone, double(std::fabs(L2[i] - tone[i])));
+    check(errTone == 0.0, "EVERY HIT: steady tone passes bit-exact from 2 s on (max error)", errTone);
+    const std::uint32_t hc1 = e2.takeHitCount();
+    check(hc1 == 1, "EVERY HIT: steady tone counts as 1 hit (its start)", double(hc1), "hits");
+
+    // Bypassed: output equals the input exactly, no allocation, meters still show the hits.
+    EveryHitProcessor e3; e3.setBypassed(true); e3.prepare(sr, 256);
+    std::vector<float> L3 = in, R3 = in;
+    long allocs3 = -1;
+    runStereo(e3, L3, R3, 256, &allocs3);
+    double err3 = 0; for (std::size_t i = 0; i < n; ++i) err3 = std::max(err3, double(std::fabs(L3[i] - in[i])));
+    check(err3 == 0.0, "EVERY HIT OFF: output equals the input exactly (max error)", err3);
+    check(allocs3 == 0, "EVERY HIT OFF: no memory allocation while metering", double(allocs3));
+    const std::uint32_t hc3 = e3.takeHitCount();
+    check(hc3 == 8, "EVERY HIT OFF: hits are still counted (8)", double(hc3), "hits");
+    check(e3.takeCutPeakDb() == 0.0f, "EVERY HIT OFF: cut meter stays at 0 dB", 0.0, "dB");
+    const float lv3 = e3.takeLevelPeakDb();
+    check(lv3 > -21.0f && lv3 < -14.0f, "EVERY HIT OFF: level meter reads the loudest hit (-15 dBFS at 9 kHz, through the 7 kHz detector)", lv3, "dBFS");
+
+    // LISTEN: output is only what was removed — the 200 Hz body is gone (> 40 dB down), 9 kHz hits remain.
+    EveryHitProcessor e4; e4.param(EveryHitProcessor::kListen).set(1); e4.prepare(sr, 256);
+    std::vector<float> L4 = in, R4 = in;
+    runStereo(e4, L4, R4, 256, nullptr);
+    const std::size_t la = start + period + 1200, lb = la + 4800;   // the first loud hit
+    check(toneDb(in, la, lb, 200, sr) - toneDb(L4, la, lb, 200, sr) > 30.0, "EVERY HIT LISTEN: 200 Hz body mostly gone from the listen signal (dB down)",
+          toneDb(in, la, lb, 200, sr) - toneDb(L4, la, lb, 200, sr), "dB");
+    check(toneDb(L4, la, lb, 9000, sr) > -40.0, "EVERY HIT LISTEN: the removed 9 kHz is audible (dBFS)", toneDb(L4, la, lb, 9000, sr), "dBFS");
+}
+
 static void benchEngine() {
     // Full chain on every stem: EQ (2 bands active) + Comp + Artifact Destroyer;
     // master: EQ + Limiter. Measures real-time factor on THIS machine.
@@ -585,7 +674,7 @@ int main() {
     testArtifactLatencyAndTransparency(); testArtifactShimmerReduction();
     testResonance(); testResonanceTransparent(); testTransient(); testWidth();
     testEngine();
-    testLoop(); testGate(); testDeEsser(); benchEngine();
+    testLoop(); testGate(); testDeEsser(); testEveryHit(); benchEngine();
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }
