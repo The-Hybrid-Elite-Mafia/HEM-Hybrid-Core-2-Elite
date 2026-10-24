@@ -157,6 +157,7 @@ struct Spectrogram {
     float hfNow = -140.0f;
     // ---- ring tracker (the same search as FIND PING, run ~4 times a second on `avg`)
     float ringHz = 0.0f, ringScore = 0.0f;
+    int quietCols = 0;   // FFT frames in a row with nothing above -75 dB (the stem is silent)
 
     void prepare(double rate) {
         sr = rate; fft.prepare(kN);
@@ -181,7 +182,7 @@ struct Spectrogram {
         for (int r = 0; r < kLRows; ++r) { landHarsh[r] = 0; landHarshHz[r] = 0; }
         landHead = landSub = 0; landRows = 0; pendHarsh = 0;
         hitHead = hitCount = 0; hfFloor = -140.0f; lastHitCol = 0; hfNow = -140.0f;
-        ringHz = ringScore = 0.0f;
+        ringHz = ringScore = 0.0f; quietCols = 0;
         disp.assign(kN / 2 + 1, 0.0f); avg.assign(kN / 2 + 1, 0.0f); frames = 0; col = 0;
         pos = since = 0; head = 0;
     }
@@ -198,6 +199,15 @@ struct Spectrogram {
         for (int i = 0; i < hitCount; ++i) {
             const Hit& h = hits[(hitHead - 1 - i + kMaxHits) % kMaxHits];
             if (col - h.col > span) break;
+            ++n;
+        }
+        return n;
+    }
+    // Harsh hits made after FFT frame `fromCol` (for FIND HARSH: hits heard since the click).
+    int hitsSince(std::uint64_t fromCol) const {
+        int n = 0;
+        for (int i = 0; i < hitCount; ++i) {
+            if (hits[(hitHead - 1 - i + kMaxHits) % kMaxHits].col <= fromCol) break;
             ++n;
         }
         return n;
@@ -273,8 +283,11 @@ struct Spectrogram {
             for (auto& v : landPend) v = -140.0f;
             pendHarsh = 0;
         }
-        // Ring tracker, every 24 FFTs (~0.26 s), after the 1 s average has settled.
-        if (col % 24 == 0) {
+        // Ring tracker, every 24 FFTs (~0.26 s), after the 1 s average has settled. A silent stem has no
+        // ring: the 1 s average still holds the last notes, so it is cleared after ~0.25 s of silence.
+        quietCols = totDb < -75.0f ? quietCols + 1 : 0;
+        if (quietCols > 24) ringScore = 0.0f;
+        else if (col % 24 == 0) {
             float hz = 0.0f;
             const float sc = frames >= 40 ? pingSearch(avg, kN, sr, hz) : 0.0f;
             if (sc >= 8.0f) { ringHz = hz; ringScore = sc; } else ringScore = std::max(0.0f, ringScore - 1.5f);
@@ -462,10 +475,11 @@ private:
     double harshFrom_ = 0, harshUntil_ = 0;
     float harshMax_ = -200.0f, harshHz_ = 0.0f;
     int harshHits_ = 0;
+    std::uint64_t harshCol_ = 0;   // spectrogram frame when FIND HARSH was clicked
     void findHarsh();
     void updateFindHarsh();
     // 3D SCOPE (DESTROYER screen, third tab): the selected stem as a lit 3D landscape, harsh hits and rings marked.
-    float scopeYaw_ = 0.32f, scopePitch_ = 0.52f, scopeYaw0_ = 0, scopePitch0_ = 0;
+    float scopeYaw_ = 0.26f, scopePitch_ = 0.40f, scopeYaw0_ = 0, scopePitch0_ = 0;
     float scopeTop_ = -20.0f;   // auto range: dB at the top of the box (follows the stem's loudest point)
     void drawScope3D(float ox, float oy);
     int eqBand_ = 3;   // EQ band the knobs edit (0 HPF, 1 LOW, 2 BELL 1, 3 BELL 2, 4 HIGH, 5 LPF)
@@ -2596,7 +2610,7 @@ void App::drawDeEssPanel(float ox, float oy) {
     gfx_.rectOutline(cb, Color(kOrange).alpha(0.25f), 1.0f);
     if (cut > 0.05f) gfx_.rect({cb.x0 + 1, cb.y0 + 2, cb.x0 + 1 + clampf(cut / 24.0f, 0, 1) * (cb.w() - 2), cb.y1 - 2}, kOrange);
     std::string status;
-    if (harshStem_ == selected_) status = fmt("FIND HARSH: listening %.1f s", std::max(0.0, harshUntil_ - now()));
+    if (harshStem_ == selected_) status = fmt("FIND HARSH: listening... %.0f hits", spec_.hitsSince(harshCol_));
     else status = (lvl > -60.0f ? fmt("sss %.0f dB", lvl) : std::string("sss --")) + (on ? fmt("   cutting %.1f dB", cut) : std::string("   (off)"));
     gfx_.text(ox + 452, oy + 143, status, Font::Small, harshStem_ == selected_ ? kYellow : kOrange);
 
@@ -2632,7 +2646,7 @@ void App::pollDeEss() {
         DeEsserProcessor* d = slots_[i].dess;
         if (!d || !slots_[i].loaded) { dessLvl_[i] = dessHold_[i] = -100.0f; dessCut_[i] = 0.0f; continue; }
         const float lv = d->takeLevelPeakDb(), cut = d->takeCutPeakDb();
-        dessLvl_[i] = std::max(lv, dessLvl_[i] - 40.0f * dt);                    // falls 40 dB/s
+        dessLvl_[i] = std::max(lv, dessLvl_[i] - 15.0f * dt);                    // falls 15 dB/s (quick hits stay visible)
         if (lv >= dessHold_[i]) { dessHold_[i] = lv; dessHoldT_[i] = t; }
         else if (t - dessHoldT_[i] > 1.0) dessHold_[i] -= 20.0f * dt;           // peak mark: held 1 s, then falls
         if (cut >= dessCut_[i]) { dessCut_[i] = cut; dessCutT_[i] = t; }
@@ -2652,19 +2666,25 @@ void App::findHarsh() {
     d->param(DeEsserProcessor::kFreq).set(clampf(harshHz_ / 1.41f, 4000.0f, 12000.0f));   // half an octave under the hits
     d->param(DeEsserProcessor::kListen).set(0.0f);
     harshStem_ = selected_;
+    harshCol_ = spec_.col;
     harshFrom_ = now() + 0.15;   // let the detector settle on the new frequency
-    harshUntil_ = harshFrom_ + 3.0;
+    harshUntil_ = harshFrom_ + 10.0;
     harshMax_ = -200.0f;
-    toast(fmt("%.0f harsh hits", n) + fmt(" around %.1f kHz - listening 3 s to set THRESHOLD (keep it playing)", harshHz_ / 1000.0));
+    toast(fmt("%.0f harsh hits", n) + fmt(" around %.1f kHz - listening for the next hits to set THRESHOLD (keep it playing)", harshHz_ / 1000.0));
 }
 
+// FIND HARSH, second half: listens until 3 new hits have been heard (at least 1.5 s), or 10 s at most.
 void App::updateFindHarsh() {
-    if (harshStem_ < 0 || now() < harshUntil_) return;
+    if (harshStem_ < 0) return;
     const int s = harshStem_;
+    const double t = now();
+    if (selected_ != s) { harshStem_ = -1; toast("FIND HARSH stopped (another stem was picked)"); return; }
+    const bool enough = spec_.hitsSince(harshCol_) >= 3 && t >= harshFrom_ + 1.5;
+    if (!enough && t < harshUntil_) return;
     harshStem_ = -1;
     DeEsserProcessor* d = slots_[static_cast<std::size_t>(s)].dess;
     if (!d || !slots_[static_cast<std::size_t>(s)].loaded) return;
-    if (harshMax_ < -70.0f) { toast("Too quiet to set a threshold - play the harsh part and click FIND HARSH again"); return; }
+    if (harshMax_ < -70.0f) { toast("Heard no harsh hits for 10 s - play the harsh part and click FIND HARSH again"); return; }
     const float thr = clampf(std::round((harshMax_ - 10.0f) * 2.0f) * 0.5f, -60.0f, -6.0f);
     d->param(DeEsserProcessor::kThresh).set(thr);
     d->setBypassed(false);
@@ -2742,14 +2762,14 @@ void App::drawScope3D(float ox, float oy) {
     gfx_.text(ox + 30, oy + 44, "HEM", Font::Large, kText);
     gfx_.text(ox + 30 + gfx_.textWidth("HEM ", Font::Large), oy + 44, "3D SCOPE", Font::Large, kCyan);
     const std::string nm = sel().loaded ? shownName(selected_) : std::string("no stem");
-    gfx_.text(ox + 690 - gfx_.textWidth(nm, Font::Small), oy + 50, nm, Font::Small, kText);
+    gfx_.text(ox + 690 - gfx_.textWidth(nm, Font::Small), oy + 46, nm, Font::Small, kText);
 
     const Rect view{ox + 14, oy + 84, ox + 705, oy + 398};
     // Turn: drag (only when this screen fills the window), double-click resets.
     if (focus_ == DK::kDestroyer) {
         const bool hot = view.contains(in_.mx, in_.my);
         if (hot) hotId_ = 4700;
-        if (hot && in_.dbl) { scopeYaw_ = 0.32f; scopePitch_ = 0.52f; activeId_ = 0; }
+        if (hot && in_.dbl) { scopeYaw_ = 0.26f; scopePitch_ = 0.40f; activeId_ = 0; }
         else if (hot && in_.pressed) { activeId_ = 4700; dragStartX_ = in_.devX; dragStartY_ = in_.devY; scopeYaw0_ = scopeYaw_; scopePitch0_ = scopePitch_; }
         if (activeId_ == 4700) {
             if (in_.down) {
@@ -2850,12 +2870,15 @@ void App::drawScope3D(float ox, float oy) {
             line3(x, 0, kZD, x, kH, kZD, 1.0f, Color(0x3FD0FF1A));
         }
         for (int k = 0; k <= 4; ++k) line3(-kXW, 0, kZD * k / 4.0f, kXW, 0, kZD * k / 4.0f, 1.0f, Color(k == 0 ? 0x3FD0FF60 : 0x3FD0FF22));
-        for (int k = 0; k <= 3; ++k) {   // level lines on the back wall, every 24 dB under the top
+        float lastLy = -1e9f;
+        for (int k = 0; k <= 2; ++k) {   // level lines on the back wall, every 24 dB under the top
             const float db = scopeTop_ - 24.0f * k;
             const float y = heightOf(levelT(db));
             line3(-kXW, y, kZD, kXW, y, kZD, 1.0f, Color(k == 0 ? 0x3FD0FF55 : 0x3FD0FF22));
             float lx, ly;
             P(-kXW - 0.03f, y, kZD, lx, ly);
+            if (ly - lastLy < 16.0f) continue;   // too close to the one above: line only
+            lastLy = ly;
             const std::string t = fmt("%.0f dB", db);
             gfx_.text(lx - gfx_.textWidth(t, Font::Small) - 4, ly - 8, t, Font::Small, Color(kDim).alpha(0.85f));
         }
@@ -2891,8 +2914,12 @@ void App::drawScope3D(float ox, float oy) {
         }
         float xy[2 * kPts];
         for (int i = 0; i < kPts; ++i) P(pointX(i), Hh[static_cast<std::size_t>(i)], 0, xy[2 * i], xy[2 * i + 1]);
-        gfx_.polyline(xy, kPts, 5.0f, Color(0xFFB86B40));
-        gfx_.polyline(xy, kPts, 2.0f, Color(0xFFF1C8F0));
+        for (int i = 0; i < kPts - 1; ++i) {   // the ridge glows where there is sound, and fades out where there is none
+            const float a = clampf(4.0f * std::max(T[static_cast<std::size_t>(i)], T[static_cast<std::size_t>(i + 1)]), 0.0f, 1.0f);
+            if (a <= 0.01f) continue;
+            gfx_.line(xy[2 * i], xy[2 * i + 1], xy[2 * i + 2], xy[2 * i + 3], 5.0f, Color(0xFFB86B40).alpha(a));
+            gfx_.line(xy[2 * i], xy[2 * i + 1], xy[2 * i + 2], xy[2 * i + 3], 2.0f, Color(0xFFF1C8F0).alpha(a));
+        }
     }
 
     // ---- ring: a magenta curtain along time at the ringing pitch.
@@ -2981,8 +3008,10 @@ void App::drawScope3D(float ox, float oy) {
     }
     if (focus_ == DK::kDestroyer && !sel().loaded)
         gfx_.textIn(view, "Load stems and press play", Font::Normal, kDim);
-    else if (focus_ == DK::kDestroyer)
-        gfx_.text(view.x0 + 6, view.y0 + 2, "DRAG TO TURN  /  DOUBLE-CLICK TO RESET", Font::Small, Color(kDim).alpha(0.6f));
+    else if (focus_ == DK::kDestroyer) {
+        const char* hint = "DRAG TO TURN  /  DOUBLE-CLICK TO RESET";
+        gfx_.text(ox + 690 - gfx_.textWidth(hint, Font::Small), oy + 70, hint, Font::Small, Color(kDim).alpha(0.6f));
+    }
 }
 
 // ====================================================================================== the desk
