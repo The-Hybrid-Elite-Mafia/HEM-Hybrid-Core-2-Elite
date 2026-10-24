@@ -287,6 +287,7 @@ private:
     void drawDesk();          // desk picture + glass of every monitor (before the screens)
     void drawDeskChrome();    // hover / click on the desk, masks and the screen bar (after the screens)
     void drawNowPlaying();
+    void feedSpectrum();   // selected stem's tap → spec_ (every frame: DESTROYER's picture, EQ's spectrum, FIND PING)
     void drawStemPicker(int idBase, float x0, float y0, float h, float maxW = 1.0e9f);
     float tabsX0_ = 0;   // left edge of the last tab row drawn (so the stem picker stops before it)
     // Plug-in tabs on the per-stem monitors: DESTROYER | EQ, RESONANCE | DE-ESSER, TRANSIENT | COMP | GATE.
@@ -1315,6 +1316,7 @@ void App::frame() {
     eng_->masterSnapshot().update();
     master_ = eng_->masterSnapshot().read_buffer();
 
+    feedSpectrum();
     gfx_.beginFrame(0x040506FF);
     drawDesk();
     for (int i = 0; i < DK::kNumScreens; ++i) drawScreen(i);
@@ -1620,6 +1622,24 @@ void App::drawArrange() {
 }
 
 // ------------------------------------------------------------------ STFT DESTROYER
+void App::feedSpectrum() {
+    // Spectrogram of the selected stem (post-processing, live while playing).
+    if (specFor_ != selected_) {
+        spec_.prepare(sr_);
+        float junk[2048];
+        auto& tap = eng_->stem(static_cast<std::size_t>(selected_)).tap;
+        while (tap.pop_n(junk, 2048) > 0) {}
+        specFor_ = selected_;
+    }
+    {
+        float buf[2048];
+        std::size_t n;
+        auto& tap = eng_->stem(static_cast<std::size_t>(selected_)).tap;
+        const bool live = eng_->isPlaying();   // freeze the picture when stopped
+        while ((n = tap.pop_n(buf, 2048)) > 0) if (live) spec_.feed(buf, n);
+    }
+}
+
 void App::drawDestroyer() {
     ArtifactProcessor* ds = sel().ds;
     if (!ds) return;
@@ -1638,21 +1658,6 @@ void App::drawDestroyer() {
     if (hwButton(303, LY::dsNext, Icon::Right) || button(304, R(LY::dsHeaderBox))) mode = (mode + 1) % 3, ds->param(ArtifactProcessor::kShimmer).set(amounts[mode]);
     gfx_.textIn(R(LY::dsHeaderBox), modes[mode], Font::Normal, kText);
 
-    // Spectrogram of the selected stem (post-processing, live while playing).
-    if (specFor_ != selected_) {
-        spec_.prepare(sr_);
-        float junk[2048];
-        auto& tap = eng_->stem(static_cast<std::size_t>(selected_)).tap;
-        while (tap.pop_n(junk, 2048) > 0) {}
-        specFor_ = selected_;
-    }
-    {
-        float buf[2048];
-        std::size_t n;
-        auto& tap = eng_->stem(static_cast<std::size_t>(selected_)).tap;
-        const bool live = eng_->isPlaying();   // freeze the picture when stopped
-        while ((n = tap.pop_n(buf, 2048)) > 0) if (live) spec_.feed(buf, n);
-    }
     const Rect sc = R(LY::dsScreen).inset(3);
     const Rect area{sc.x0, sc.y0, sc.x1 - 16, sc.y1};
     const float cw = area.w() / Spectrogram::kCols, ch = area.h() / Spectrogram::kRows;
@@ -2372,7 +2377,7 @@ void App::drawGatePanel(float ox, float oy) {
     gfx_.rect(m, 0x05080BFF);
     gfx_.rectOutline(m, Color(kCyan).alpha(0.2f), 1.2f);
     auto mx = [&](float db) { return m.x0 + clampf((db + 80.0f) / 80.0f, 0, 1) * m.w(); };
-    const float lv = on ? g->keyLevelDb() : -120.0f;
+    const float lv = g->keyLevelDb();   // shown even while OFF, so THRESHOLD can be set first
     gfx_.rect({m.x0 + 2, m.y0 + 4, mx(lv), m.y1 - 4}, lv > th.target() ? kGreen : Color(0x2E6A84FF));
     gfx_.line(mx(th.target()), m.y0 - 6, mx(th.target()), m.y1 + 6, 3.0f, kCyan);
     gfx_.line(mx(th.target() - GateProcessor::kHysteresisDb), m.y0, mx(th.target() - GateProcessor::kHysteresisDb), m.y1, 1.0f, Color(kCyan).alpha(0.4f));
@@ -2457,7 +2462,7 @@ void App::drawScreen(int i) {
         if (i == DK::kDestroyer) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t0, 2);
         else if (i == DK::kResonance) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t2, 2);
         else drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t3, 3);
-        drawStemPicker(9100 + 10 * i, sc.src.x0 + 12, sc.src.y0 + 3, 27, tabsX0_ - 10 - (sc.src.x0 + 12));
+        // (The stem picker sits in the top bar while this screen is open — see drawDeskChrome.)
     }
 }
 
@@ -2535,6 +2540,8 @@ void App::drawDeskChrome() {
             gfx_.rectOutline(rs[i], Color(kCyan).alpha(hot ? 0.9f : 0.45f), 1.5f);
             gfx_.textIn(rs[i], labels[i], Font::Small, i == 1 ? Color(0x041016FF) : kText);
         }
+        if (focus_ == DK::kDestroyer || focus_ == DK::kResonance || focus_ == DK::kTransient)
+            drawStemPicker(9100, 10, 8, th, 520);   // which stem this screen works on
         const std::string nm = DK::kScreens[focus_].name;
         const float nw = gfx_.textWidth(nm, Font::Small) + 24;
         const Rect name{prev.x0 - gap - nw, 8, prev.x0 - gap, 8 + th};

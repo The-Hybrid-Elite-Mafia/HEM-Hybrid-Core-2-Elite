@@ -45,7 +45,16 @@ public:
         env_ = 0.0f; gain_ = 1.0f; holdLeft_ = 0; open_ = false;
     }
     void process(AudioBlock& b) noexcept override {
-        if (bypassed()) { openFlag_.store(true, std::memory_order_relaxed); grDb_.store(0.0f, std::memory_order_relaxed); return; }
+        if (bypassed()) {   // off: pass the audio untouched, but keep the level bar alive so Threshold can be set first
+            float pk = 0.0f;
+            for (std::uint32_t c = 0; c < b.numChannels; ++c)
+                for (std::uint32_t i = 0; i < b.numFrames; ++i) pk = std::max(pk, std::fabs(b.ch[c][i]));
+            const float decay = std::pow(coef(10.0f), static_cast<float>(b.numFrames));
+            env_ = std::max(pk, env_ * decay);
+            levelDb_.store(simd::gain_to_db(env_), std::memory_order_relaxed);
+            openFlag_.store(true, std::memory_order_relaxed); grDb_.store(0.0f, std::memory_order_relaxed);
+            return;
+        }
         updateKey();
         const float thrDb = p_[kThresh].target();
         const float closeDb = thrDb - kHysteresisDb;
