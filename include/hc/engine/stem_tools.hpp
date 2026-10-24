@@ -152,12 +152,29 @@ public:
         env_ = 0.0f; lastCut_ = 0.0f;
     }
     void process(AudioBlock& b) noexcept override {
-        if (bypassed()) { grDb_.store(0.0f, std::memory_order_relaxed); return; }
         updateDetector();
+        const std::uint32_t nch = std::min<std::uint32_t>(b.numChannels, 2);
+        if (bypassed()) {
+            // OFF: the audio is not touched, but the detector still runs on a copy so the meter shows
+            // how loud the "sss" is and THRESHOLD can be set before switching on.
+            float peak = 0.0f;
+            for (std::uint32_t i = 0; i < b.numFrames; ++i) {
+                float a = 0.0f;
+                for (std::uint32_t c = 0; c < nch; ++c) {
+                    double x = b.ch[c][i];
+                    for (auto& f : det_[c]) x = f.tick(x);
+                    a = std::max(a, static_cast<float>(std::fabs(x)));
+                }
+                env_ = a > env_ ? a + (env_ - a) * att_ : a + (env_ - a) * rel_;
+                peak = std::max(peak, env_);
+            }
+            publish(peak, 0.0f);
+            lastCut_ = -1.0f;   // switching back on redesigns the shelf from where the cut is
+            return;
+        }
         const float thr = p_[kThresh].target(), maxCut = p_[kMaxCut].target(), hz = p_[kFreq].target();
         const bool listen = p_[kListen].target() > 0.5f;
-        const std::uint32_t nch = std::min<std::uint32_t>(b.numChannels, 2);
-        float peakGr = 0.0f;
+        float peakGr = 0.0f, peakEnv = 0.0f;
         for (std::uint32_t o = 0; o < b.numFrames; o += kSub) {
             const std::uint32_t n = std::min<std::uint32_t>(kSub, b.numFrames - o);
             // Detector: peak follower on the high band (a copy; the audio itself is never split).
@@ -170,6 +187,7 @@ public:
                     a = std::max(a, static_cast<float>(std::fabs(x)));
                 }
                 env_ = a > env_ ? a + (env_ - a) * att_ : a + (env_ - a) * rel_;
+                peakEnv = std::max(peakEnv, env_);
                 const float over = simd::gain_to_db(env_) - thr;
                 cut = std::max(cut, over > 0.0f ? std::min(maxCut, over * (1.0f - 1.0f / kRatio)) : 0.0f);
             }
@@ -192,8 +210,14 @@ public:
                 if (listen) for (std::uint32_t i = 0; i < n; ++i) x[i] = dry_[c][i] - x[i];   // only what's removed
             }
         }
-        grDb_.store(-peakGr, std::memory_order_relaxed);
+        publish(peakEnv, peakGr);
     }
+    // Meters for the UI. The audio thread keeps the LOUDEST value since the UI last asked, so a cut or an
+    // "sss" that lasts only a few milliseconds is never missed between two screen frames.
+    // takeLevelPeakDb(): loudest detector level (dBFS of the band above FREQUENCY), works while OFF too.
+    // takeCutPeakDb(): biggest cut in dB (positive), 0 while OFF.
+    float takeLevelPeakDb() noexcept { return simd::gain_to_db(std::max(lvlPeak_.exchange(0.0f, std::memory_order_acq_rel), 1.0e-7f)); }
+    float takeCutPeakDb() noexcept { return cutPeak_.exchange(0.0f, std::memory_order_acq_rel); }
     std::size_t numParams() const noexcept override { return kNumParams; }
     AtomicParam& param(std::size_t i) noexcept override { return p_[i < kNumParams ? i : 0]; }
     float meterValue() const noexcept override { return grDb_.load(std::memory_order_relaxed); }
@@ -223,6 +247,14 @@ private:
     Biquad shelf_[2];    // the audio path: one high shelf per channel
     float lastHz_ = -1.0f, env_ = 0.0f, lastCut_ = 0.0f, att_ = 0.0f, rel_ = 0.0f;
     std::atomic<float> grDb_{0.0f};
+    std::atomic<float> lvlPeak_{0.0f}, cutPeak_{0.0f};
+    void publish(float env, float cut) noexcept {
+        grDb_.store(-cut, std::memory_order_relaxed);
+        float o = lvlPeak_.load(std::memory_order_relaxed);
+        while (env > o && !lvlPeak_.compare_exchange_weak(o, env, std::memory_order_acq_rel)) {}
+        o = cutPeak_.load(std::memory_order_relaxed);
+        while (cut > o && !cutPeak_.compare_exchange_weak(o, cut, std::memory_order_acq_rel)) {}
+    }
 };
 
 } // namespace hc

@@ -80,6 +80,41 @@ std::string timeStr(double sec) {
 std::string lufsStr(float v) { return std::isfinite(v) && v > -70.0f ? fmt("%.1f", v) : std::string("--"); }
 
 // ------------------------------------------------------------------ spectrogram (UI thread)
+// Looks for a ring: a narrow peak standing out from its neighbourhood (±1/6 octave) in a power spectrum
+// (power per FFT bin, kN/2+1 values). Returns how many dB it stands out (0 = none) and its pitch in `hz`.
+float pingSearch(const std::vector<float>& pw, int N, double sr, float& hz) {
+    if (pw.size() != static_cast<std::size_t>(N / 2 + 1)) return 0.0f;
+    std::vector<float> db(static_cast<std::size_t>(N / 2 + 1));
+    float maxDb = -200.0f;
+    for (int k = 1; k <= N / 2; ++k) {
+        db[static_cast<std::size_t>(k)] = 10.0f * std::log10(pw[static_cast<std::size_t>(k)] + 1e-20f);
+        maxDb = std::max(maxDb, db[static_cast<std::size_t>(k)]);
+    }
+    int best = -1;
+    float bestScore = 0.0f;
+    std::vector<float> nb;
+    nb.reserve(64);
+    for (int k = 2; k < N / 2 - 1; ++k) {
+        const double f = static_cast<double>(k) * sr / N;
+        if (f < 150.0 || f > 12000.0) continue;
+        const float v = db[static_cast<std::size_t>(k)];
+        if (v < maxDb - 45.0f || v < db[static_cast<std::size_t>(k - 1)] || v < db[static_cast<std::size_t>(k + 1)]) continue;
+        const int lo = std::max(1, static_cast<int>(k / 1.1225)), hi = std::min(N / 2, static_cast<int>(k * 1.1225) + 1);
+        nb.clear();
+        for (int j = lo; j <= hi; ++j) if (std::abs(j - k) > 1) nb.push_back(db[static_cast<std::size_t>(j)]);
+        if (nb.size() < 4) continue;
+        std::nth_element(nb.begin(), nb.begin() + static_cast<std::ptrdiff_t>(nb.size() / 2), nb.end());
+        const float score = v - nb[nb.size() / 2];
+        if (score > bestScore) { bestScore = score; best = k; }
+    }
+    if (best < 0) return 0.0f;
+    const float a = db[static_cast<std::size_t>(best - 1)], bb = db[static_cast<std::size_t>(best)], c = db[static_cast<std::size_t>(best + 1)];
+    const float den = a - 2 * bb + c;
+    const float off = std::fabs(den) > 1e-6f ? 0.5f * (a - c) / den : 0.0f;
+    hz = static_cast<float>((best + clampf(off, -0.5f, 0.5f)) * sr / N);
+    return bestScore;
+}
+
 struct Spectrogram {
     static constexpr int kCols = 224, kRows = 56, kN = 1024, kHop = 512;
     float cell[kCols][kRows] = {};
@@ -93,6 +128,35 @@ struct Spectrogram {
     // Fine spectra (power per FFT bin): `disp` follows quickly (EQ screen), `avg` over ~1 s (ping finder).
     std::vector<float> disp, avg;
     int frames = 0;
+    std::uint64_t col = 0;   // FFT frames made since prepare (one every 512 samples = 10.7 ms)
+
+    // ---- 3D landscape: kLRows rows (row 0 = newest), each the loudest of kLSub FFTs, kLPts log-spaced
+    // points 30 Hz .. 20 kHz, in dB (a full-scale sine reads 0 dB). 72 x 3 x 10.7 ms = 2.3 s of history.
+    static constexpr int kLRows = 72, kLPts = 112, kLSub = 3;
+    float land[kLRows][kLPts] = {};
+    std::uint8_t landHarsh[kLRows] = {};   // 1 = a harsh hit happened in this row
+    float landHarshHz[kLRows] = {};
+    int landHead = 0, landSub = 0;
+    float landPend[kLPts] = {};
+    std::uint8_t pendHarsh = 0;
+    float pendHarshHz = 0;
+    std::uint64_t landRows = 0;
+    int ptLo[kLPts] = {}, ptHi[kLPts] = {};
+    static float landHz(int i) { return 30.0f * std::pow(20000.0f / 30.0f, static_cast<float>(i) / (kLPts - 1)); }
+    const float* landRow(int age) const { return land[(landHead - 1 - age + 2 * kLRows) % kLRows]; }
+    int landIdx(int age) const { return (landHead - 1 - age + 2 * kLRows) % kLRows; }
+
+    // ---- harsh hits: a short burst in the highs (5-16 kHz) that jumps 9 dB over the level between hits
+    // and makes up most of the sound at that moment (tambourine, hats, shakers, a vocal "sss").
+    struct Hit { std::uint64_t col; float hz, db; };
+    static constexpr int kMaxHits = 512;
+    Hit hits[kMaxHits] = {};
+    int hitHead = 0, hitCount = 0;
+    float hfFloor = -140.0f;
+    std::uint64_t lastHitCol = 0;
+    float hfNow = -140.0f;
+    // ---- ring tracker (the same search as FIND PING, run ~4 times a second on `avg`)
+    float ringHz = 0.0f, ringScore = 0.0f;
 
     void prepare(double rate) {
         sr = rate; fft.prepare(kN);
@@ -104,8 +168,21 @@ struct Spectrogram {
             const double f = 40.0 * std::pow(20000.0 / 40.0, static_cast<double>(r) / kRows);
             rowBin[r] = std::clamp(static_cast<int>(f * kN / sr), 1, kN / 2);
         }
+        for (int i = 0; i < kLPts; ++i) {   // FFT bins under each landscape point (at least the nearest one)
+            const double f0 = i > 0 ? std::sqrt(static_cast<double>(landHz(i - 1)) * landHz(i)) : landHz(0);
+            const double f1 = i < kLPts - 1 ? std::sqrt(static_cast<double>(landHz(i)) * landHz(i + 1)) : landHz(i);
+            int lo = static_cast<int>(std::ceil(f0 * kN / sr)), hi = static_cast<int>(std::floor(f1 * kN / sr));
+            if (hi < lo) lo = hi = static_cast<int>(std::lround(landHz(i) * kN / sr));
+            ptLo[i] = std::clamp(lo, 1, kN / 2); ptHi[i] = std::clamp(hi, ptLo[i], kN / 2);
+        }
         for (auto& c : cell) for (auto& v : c) v = -140.0f;
-        disp.assign(kN / 2 + 1, 0.0f); avg.assign(kN / 2 + 1, 0.0f); frames = 0;
+        for (auto& r : land) for (auto& v : r) v = -140.0f;
+        for (auto& v : landPend) v = -140.0f;
+        for (int r = 0; r < kLRows; ++r) { landHarsh[r] = 0; landHarshHz[r] = 0; }
+        landHead = landSub = 0; landRows = 0; pendHarsh = 0;
+        hitHead = hitCount = 0; hfFloor = -140.0f; lastHitCol = 0; hfNow = -140.0f;
+        ringHz = ringScore = 0.0f;
+        disp.assign(kN / 2 + 1, 0.0f); avg.assign(kN / 2 + 1, 0.0f); frames = 0; col = 0;
         pos = since = 0; head = 0;
     }
     void feed(const float* x, std::size_t n) {
@@ -114,15 +191,47 @@ struct Spectrogram {
             if (++since == kHop) { since = 0; column(); }
         }
     }
+    // Harsh hits in the last `seconds`.
+    int hitsWithin(double seconds) const {
+        const std::uint64_t span = static_cast<std::uint64_t>(seconds * sr / kHop);
+        int n = 0;
+        for (int i = 0; i < hitCount; ++i) {
+            const Hit& h = hits[(hitHead - 1 - i + kMaxHits) % kMaxHits];
+            if (col - h.col > span) break;
+            ++n;
+        }
+        return n;
+    }
+    // Median frequency of the harsh hits in the last `seconds` (0 = none).
+    float hitHzWithin(double seconds) const {
+        const std::uint64_t span = static_cast<std::uint64_t>(seconds * sr / kHop);
+        std::vector<float> f;
+        for (int i = 0; i < hitCount; ++i) {
+            const Hit& h = hits[(hitHead - 1 - i + kMaxHits) % kMaxHits];
+            if (col - h.col > span) break;
+            f.push_back(h.hz);
+        }
+        if (f.empty()) return 0.0f;
+        std::nth_element(f.begin(), f.begin() + static_cast<std::ptrdiff_t>(f.size() / 2), f.end());
+        return f[f.size() / 2];
+    }
     void column() {
         for (int i = 0; i < kN; ++i) frame[i] = ring[(pos + i) % kN] * win[i];
         fft.forward(frame.data(), re.data(), im.data());
+        double hf = 0.0, tot = 0.0, best = 0.0;
+        int bestK = 0;
+        const int k150 = static_cast<int>(150.0 * kN / sr), k4k = static_cast<int>(4000.0 * kN / sr);
+        const int k5k = static_cast<int>(5000.0 * kN / sr), k16k = std::min(kN / 2, static_cast<int>(16000.0 * kN / sr));
         for (int k = 0; k <= kN / 2; ++k) {
             const float pw = re[k] * re[k] + im[k] * im[k];
             disp[k] += (pw - disp[k]) * 0.35f;
             avg[k] += (pw - avg[k]) * 0.012f;
+            if (k >= k150) tot += pw;
+            if (k >= k5k && k <= k16k) hf += pw;
+            if (k >= k4k && k <= k16k && pw > best) { best = pw; bestK = k; }
         }
         ++frames;
+        ++col;
         float* c = cell[head];
         for (int r = 0; r < kRows; ++r) {
             float m = 0.0f;
@@ -130,6 +239,46 @@ struct Spectrogram {
             c[r] = 10.0f * std::log10(m + 1e-20f) + cal;
         }
         head = (head + 1) % kCols;
+
+        // Harsh hits. Floor = the level between hits: falls fast (150 ms), rises slowly (1.5 s).
+        const float hfDb = static_cast<float>(10.0 * std::log10(hf + 1e-20)) + cal;
+        const float totDb = static_cast<float>(10.0 * std::log10(tot + 1e-20)) + cal;
+        hfNow = hfDb;
+        const double fps = sr / kHop;
+        const float up = static_cast<float>(std::exp(-1.0 / (fps * 1.5))), dn = static_cast<float>(std::exp(-1.0 / (fps * 0.15)));
+        const float prevFloor = hfFloor;
+        hfFloor = hfDb + (hfFloor - hfDb) * (hfDb > hfFloor ? up : dn);
+        bool hit = false;
+        if (hfDb > -60.0f && hfDb - prevFloor >= 9.0f && hfDb >= totDb - 6.0f && col - lastHitCol >= 6 && frames > 8) {
+            hit = true;
+            lastHitCol = col;
+            hits[hitHead] = {col, static_cast<float>(bestK * sr / kN), hfDb};
+            hitHead = (hitHead + 1) % kMaxHits;
+            hitCount = std::min(hitCount + 1, kMaxHits);
+        }
+
+        // Landscape row (loudest of kLSub FFTs).
+        for (int i = 0; i < kLPts; ++i) {
+            float m = 0.0f;
+            for (int k = ptLo[i]; k <= ptHi[i]; ++k) m = std::max(m, re[k] * re[k] + im[k] * im[k]);
+            landPend[i] = std::max(landPend[i], 10.0f * std::log10(m + 1e-20f) + cal);
+        }
+        if (hit) { pendHarsh = 1; pendHarshHz = static_cast<float>(bestK * sr / kN); }
+        if (++landSub == kLSub) {
+            landSub = 0;
+            std::copy(landPend, landPend + kLPts, land[landHead]);
+            landHarsh[landHead] = pendHarsh; landHarshHz[landHead] = pendHarshHz;
+            landHead = (landHead + 1) % kLRows;
+            ++landRows;
+            for (auto& v : landPend) v = -140.0f;
+            pendHarsh = 0;
+        }
+        // Ring tracker, every 24 FFTs (~0.26 s), after the 1 s average has settled.
+        if (col % 24 == 0) {
+            float hz = 0.0f;
+            const float sc = frames >= 40 ? pingSearch(avg, kN, sr, hz) : 0.0f;
+            if (sc >= 8.0f) { ringHz = hz; ringScore = sc; } else ringScore = std::max(0.0f, ringScore - 1.5f);
+        }
     }
 };
 
@@ -302,6 +451,23 @@ private:
     void drawGatePanel(float ox, float oy);
     void drawDeEssPanel(float ox, float oy);
     void findPing();
+    // De-esser meters, per stem (UI side): the loudest "sss" level / cut since the last frame, with ballistics.
+    std::array<float, kNumStems> dessLvl_{}, dessHold_{}, dessCut_{};
+    std::array<double, kNumStems> dessHoldT_{}, dessCutT_{};
+    double lastPoll_ = 0;
+    void pollDeEss();
+    // FIND HARSH: frequency from the harsh hits heard in the last 8 s, then 3 s of listening to the
+    // de-esser's own detector for THRESHOLD (10 dB under the loudest hit), then switch it on.
+    int harshStem_ = -1;
+    double harshFrom_ = 0, harshUntil_ = 0;
+    float harshMax_ = -200.0f, harshHz_ = 0.0f;
+    int harshHits_ = 0;
+    void findHarsh();
+    void updateFindHarsh();
+    // 3D SCOPE (DESTROYER screen, third tab): the selected stem as a lit 3D landscape, harsh hits and rings marked.
+    float scopeYaw_ = 0.32f, scopePitch_ = 0.52f, scopeYaw0_ = 0, scopePitch0_ = 0;
+    float scopeTop_ = -20.0f;   // auto range: dB at the top of the box (follows the stem's loudest point)
+    void drawScope3D(float ox, float oy);
     int eqBand_ = 3;   // EQ band the knobs edit (0 HPF, 1 LOW, 2 BELL 1, 3 BELL 2, 4 HIGH, 5 LPF)
     void toggleFullscreen();
     bool fullscreen_ = false;
@@ -1317,6 +1483,8 @@ void App::frame() {
     master_ = eng_->masterSnapshot().read_buffer();
 
     feedSpectrum();
+    pollDeEss();
+    updateFindHarsh();
     gfx_.beginFrame(0x040506FF);
     drawDesk();
     for (int i = 0; i < DK::kNumScreens; ++i) drawScreen(i);
@@ -2275,36 +2443,9 @@ void App::findPing() {
         toast("Play the part with the ping first, then click FIND PING while it rings");
         return;
     }
-    const int N = Spectrogram::kN;
-    std::vector<float> db(static_cast<std::size_t>(N / 2 + 1));
-    float maxDb = -200.0f;
-    for (int k = 1; k <= N / 2; ++k) {
-        db[static_cast<std::size_t>(k)] = 10.0f * std::log10(spec_.avg[static_cast<std::size_t>(k)] + 1e-20f);
-        maxDb = std::max(maxDb, db[static_cast<std::size_t>(k)]);
-    }
-    int best = -1;
-    float bestScore = 0.0f;
-    std::vector<float> nb;
-    for (int k = 2; k < N / 2 - 1; ++k) {
-        const double f = static_cast<double>(k) * sr_ / N;
-        if (f < 150.0 || f > 12000.0) continue;
-        const float v = db[static_cast<std::size_t>(k)];
-        if (v < maxDb - 45.0f || v < db[static_cast<std::size_t>(k - 1)] || v < db[static_cast<std::size_t>(k + 1)]) continue;
-        // Compare with its neighbourhood (±1/6 octave, not counting the peak itself).
-        const int lo = std::max(1, static_cast<int>(k / 1.1225)), hi = std::min(N / 2, static_cast<int>(k * 1.1225) + 1);
-        nb.clear();
-        for (int j = lo; j <= hi; ++j) if (std::abs(j - k) > 1) nb.push_back(db[static_cast<std::size_t>(j)]);
-        if (nb.size() < 4) continue;
-        std::nth_element(nb.begin(), nb.begin() + static_cast<std::ptrdiff_t>(nb.size() / 2), nb.end());
-        const float score = v - nb[nb.size() / 2];
-        if (score > bestScore) { bestScore = score; best = k; }
-    }
-    if (best < 0 || bestScore < 6.0f) { toast("No clear ping found - click FIND PING while the ringing is sounding"); return; }
-    // Parabolic interpolation between bins for the exact pitch.
-    const float a = db[static_cast<std::size_t>(best - 1)], bb = db[static_cast<std::size_t>(best)], c = db[static_cast<std::size_t>(best + 1)];
-    const float den = a - 2 * bb + c;
-    const float off = std::fabs(den) > 1e-6f ? 0.5f * (a - c) / den : 0.0f;
-    const float f = static_cast<float>((best + clampf(off, -0.5f, 0.5f)) * sr_ / N);
+    float f = 0.0f;
+    const float bestScore = pingSearch(spec_.avg, Spectrogram::kN, sr_, f);
+    if (bestScore < 6.0f) { toast("No clear ping found - click FIND PING while the ringing is sounding"); return; }
     eq->param(3 * 3).set(f);
     eq->param(3 * 3 + 1).set(-9.0f);
     eq->param(3 * 3 + 2).set(8.0f);
@@ -2402,31 +2543,446 @@ void App::drawGatePanel(float ox, float oy) {
 void App::drawDeEssPanel(float ox, float oy) {
     DeEsserProcessor* d = sel().dess;
     if (!d) return;
+    const auto si = static_cast<std::size_t>(selected_);
     const bool on = panelFrame(900, ox, oy, "DE-ESSER", d);
     const bool dim = !on;
     AtomicParam& fr = d->param(DeEsserProcessor::kFreq);
     AtomicParam& th = d->param(DeEsserProcessor::kThresh);
     AtomicParam& mc = d->param(DeEsserProcessor::kMaxCut);
     AtomicParam& li = d->param(DeEsserProcessor::kListen);
-    const float cut = on ? -d->meterValue() : 0.0f;
-    const Rect m{ox + 24, oy + 96, ox + 695, oy + 132};
+
+    // ---- level meter: how loud the band above FREQUENCY is (works while OFF), with the THRESHOLD line.
+    // Drag on it (or the THRESHOLD knob) to set the threshold; double-click = -24 dB.
+    const Rect m{ox + 24, oy + 90, ox + 695, oy + 120};
+    const auto xOf = [&](float db) { return m.x0 + 2 + clampf((db + 60.0f) / 60.0f, 0, 1) * (m.w() - 4); };
+    const auto dbAt = [&](float x) { return clampf((x - m.x0 - 2) / (m.w() - 4) * 60.0f - 60.0f, -60.0f, 0.0f); };
+    {
+        const bool hot = m.contains(in_.mx, in_.my);
+        if (hot) hotId_ = 916;
+        if (hot && in_.dbl) { th.set(-24.0f); activeId_ = 0; }
+        else if (hot && in_.pressed) activeId_ = 916;
+        if (activeId_ == 916) {
+            if (in_.down) th.set(std::round(dbAt(in_.mx) * 2.0f) * 0.5f);
+            if (in_.released) activeId_ = 0;
+        }
+        if (hot || activeId_ == 916) { tooltip_ = "Drag to set THRESHOLD (double-click = -24 dB)"; tipX_ = clampf(in_.mx, m.x0 + 160, m.x1 - 160); tipY_ = m.y0 - 6; tipSec_ = curSec_; }
+    }
+    const float thr = th.target(), lvl = dessLvl_[si], hold = dessHold_[si];
     gfx_.rect(m, 0x05080BFF);
-    gfx_.rectOutline(m, Color(kOrange).alpha(0.25f), 1.2f);
-    gfx_.rect({m.x0 + 2, m.y0 + 4, m.x0 + 2 + clampf(cut / 24.0f, 0, 1) * (m.w() - 4), m.y1 - 4}, kOrange);
-    gfx_.textIn({ox + 24, oy + 136, ox + 695, oy + 160}, on ? fmt("cutting %.1f dB", cut) : std::string("off"), Font::Small, kOrange);
+    gfx_.rectOutline(m, Color(kOrange).alpha(0.3f), 1.2f);
+    for (float db : {-48.0f, -36.0f, -24.0f, -12.0f}) gfx_.line(xOf(db), m.y0 + 2, xOf(db), m.y1 - 2, 1.0f, Color(0xFFFFFF0C));
+    if (lvl > -60.0f) {
+        const float xl = xOf(lvl), xt = xOf(thr);
+        gfx_.gradientV({m.x0 + 2, m.y0 + 4, std::min(xl, xt), m.y1 - 4}, Color(0xD9933AFF).alpha(dim ? 0.55f : 0.9f), Color(0x8A5420FF).alpha(dim ? 0.55f : 0.9f));
+        if (xl > xt) gfx_.gradientV({xt, m.y0 + 4, xl, m.y1 - 4}, 0xFF5A2AFF, 0xC0281AFF);   // over the threshold: this part gets cut
+    }
+    if (hold > -60.0f) gfx_.rect({xOf(hold) - 1.5f, m.y0 + 3, xOf(hold) + 1.5f, m.y1 - 3}, Color(0xFFE2B0FF).alpha(0.85f));
+    {
+        const float xt = xOf(thr);
+        gfx_.rect({xt - 1.2f, m.y0 - 5, xt + 1.2f, m.y1 + 5}, 0xF4F7FAFF);
+        gfx_.triangle(xt - 6, m.y0 - 11, xt + 6, m.y0 - 11, xt, m.y0 - 4, 0xF4F7FAFF);
+    }
+    for (float db : {-60.0f, -48.0f, -36.0f, -24.0f, -12.0f, 0.0f}) {
+        const std::string t = db == 0.0f ? std::string("0 dB") : fmt("%.0f", db);
+        const float w = gfx_.textWidth(t, Font::Small);
+        const float x = clampf(xOf(db) - w * 0.5f, m.x0, m.x1 - w);
+        gfx_.text(x, m.y1 + 2, t, Font::Small, Color(kDim).alpha(0.9f));
+    }
+    // ---- cut: held for a moment so short cuts are seen.
+    const float cut = on ? dessCut_[si] : 0.0f;
+    gfx_.text(ox + 24, oy + 145, "CUT", Font::Small, dim ? kDim : kText);
+    const Rect cb{ox + 70, oy + 149, ox + 440, oy + 161};
+    gfx_.rect(cb, 0x05080BFF);
+    gfx_.rectOutline(cb, Color(kOrange).alpha(0.25f), 1.0f);
+    if (cut > 0.05f) gfx_.rect({cb.x0 + 1, cb.y0 + 2, cb.x0 + 1 + clampf(cut / 24.0f, 0, 1) * (cb.w() - 2), cb.y1 - 2}, kOrange);
+    std::string status;
+    if (harshStem_ == selected_) status = fmt("FIND HARSH: listening %.1f s", std::max(0.0, harshUntil_ - now()));
+    else status = (lvl > -60.0f ? fmt("sss %.0f dB", lvl) : std::string("sss --")) + (on ? fmt("   cutting %.1f dB", cut) : std::string("   (off)"));
+    gfx_.text(ox + 452, oy + 143, status, Font::Small, harshStem_ == selected_ ? kYellow : kOrange);
+
     const float kr = 44, ky = oy + 262;
     fr.set(panelKnob(910, ox + 120, ky, kr, fr.target(), 2000, 16000, Taper::Log, 6500, false, "FREQUENCY", fmt("%.1f kHz", fr.target() / 1000), dim, kOrange));
     th.set(panelKnob(911, ox + 290, ky, kr, th.target(), -60, 0, Taper::Linear, -24, false, "THRESHOLD", fmt("%.1f dB", th.target()), dim, kOrange));
     mc.set(panelKnob(912, ox + 460, ky, kr, mc.target(), 0, 24, Taper::Linear, 12, false, "MAX CUT", fmt("%.1f dB", mc.target()), dim, kOrange));
+    // FIND HARSH: finds the tambourine / hats / "sss" while it plays and sets FREQUENCY + THRESHOLD.
+    const Rect fb{ox + 560, oy + 178, ox + 695, oy + 222};
+    const bool learning = harshStem_ == selected_;
+    if (button(917, fb)) findHarsh();
+    gfx_.roundRect(fb, 8, learning ? Color(kYellow).alpha(0.85f) : Color(0x3A1E08F0));
+    gfx_.rectOutline(fb, Color(kOrange).alpha(hotId_ == 917 ? 0.95f : 0.6f), 1.5f);
+    gfx_.textIn(fb, "FIND HARSH", Font::Small, learning ? Color(0x140800FF) : kText);
+    if (hotId_ == 917) { tooltip_ = "Play the tambourine / hats / 'sss' part, then click: sets FREQUENCY + THRESHOLD and turns it on"; tipX_ = fb.cx() - 120; tipY_ = fb.y0 - 4; tipSec_ = curSec_; }
     const bool listen = li.target() > 0.5f;
-    const Rect lb{ox + 580, ky - 24, ox + 690, ky + 24};
+    const Rect lb{ox + 560, ky - 14, ox + 695, ky + 30};
     if (button(915, lb)) li.set(listen ? 0.0f : 1.0f);
     gfx_.roundRect(lb, 8, listen ? Color(kOrange).alpha(0.9f) : Color(0x05080BE0));
     gfx_.rectOutline(lb, Color(kOrange).alpha(hotId_ == 915 ? 0.9f : 0.5f), 1.5f);
     gfx_.textIn(lb, "LISTEN", Font::Small, listen ? Color(0x140800FF) : kText);
-    if (hotId_ == 915) { tooltip_ = "Hear only what's being cut (turn it back off when you're done)"; tipX_ = lb.cx(); tipY_ = lb.y0 - 4; tipSec_ = curSec_; }
-    gfx_.textIn({ox + 24, oy + 345, ox + 695, oy + 370}, "Hi-hats / cymbals: FREQUENCY 7-10 kHz.  Vocal \"sss\": 5-8 kHz.", Font::Small, kDim);
-    gfx_.textIn({ox + 24, oy + 372, ox + 695, oy + 397}, "Lower THRESHOLD = cuts more often. MAX CUT = the most it ever turns down.", Font::Small, kDim);
+    if (hotId_ == 915) { tooltip_ = "Hear only what's being cut (turn it back off when you're done)"; tipX_ = lb.cx() - 80; tipY_ = lb.y0 - 4; tipSec_ = curSec_; }
+    gfx_.textIn({ox + 24, oy + 345, ox + 695, oy + 370}, "FIND HARSH: play the part, click it - it sets FREQUENCY + THRESHOLD and turns on.", Font::Small, kDim);
+    gfx_.textIn({ox + 24, oy + 372, ox + 695, oy + 397}, "Red on the meter = what gets cut. Hats / tambourine 7-10 kHz, vocal \"sss\" 5-8 kHz.", Font::Small, kDim);
+}
+
+void App::pollDeEss() {
+    const double t = now();
+    const float dt = lastPoll_ > 0 ? static_cast<float>(std::min(0.25, t - lastPoll_)) : 0.0f;
+    if (lastPoll_ == 0) { dessLvl_.fill(-100.0f); dessHold_.fill(-100.0f); dessCut_.fill(0.0f); }
+    lastPoll_ = t;
+    for (std::size_t i = 0; i < kNumStems; ++i) {
+        DeEsserProcessor* d = slots_[i].dess;
+        if (!d || !slots_[i].loaded) { dessLvl_[i] = dessHold_[i] = -100.0f; dessCut_[i] = 0.0f; continue; }
+        const float lv = d->takeLevelPeakDb(), cut = d->takeCutPeakDb();
+        dessLvl_[i] = std::max(lv, dessLvl_[i] - 40.0f * dt);                    // falls 40 dB/s
+        if (lv >= dessHold_[i]) { dessHold_[i] = lv; dessHoldT_[i] = t; }
+        else if (t - dessHoldT_[i] > 1.0) dessHold_[i] -= 20.0f * dt;           // peak mark: held 1 s, then falls
+        if (cut >= dessCut_[i]) { dessCut_[i] = cut; dessCutT_[i] = t; }
+        else if (t - dessCutT_[i] > 0.8) dessCut_[i] = std::max(0.0f, dessCut_[i] - 24.0f * dt);
+        if (static_cast<int>(i) == harshStem_ && t >= harshFrom_ && t < harshUntil_) harshMax_ = std::max(harshMax_, lv);
+    }
+}
+
+void App::findHarsh() {
+    DeEsserProcessor* d = sel().dess;
+    if (!d || !sel().loaded) return;
+    if (!eng_->isPlaying()) { toast("Play the part with the tambourine / hats / 'sss' first, then click FIND HARSH"); return; }
+    const int n = spec_.hitsWithin(8.0);
+    if (n < 3) { toast("No harsh hits in the last 8 s - play a part with tambourine, hats or 'sss', then click FIND HARSH"); return; }
+    harshHz_ = spec_.hitHzWithin(8.0);
+    harshHits_ = n;
+    d->param(DeEsserProcessor::kFreq).set(clampf(harshHz_ / 1.41f, 4000.0f, 12000.0f));   // half an octave under the hits
+    d->param(DeEsserProcessor::kListen).set(0.0f);
+    harshStem_ = selected_;
+    harshFrom_ = now() + 0.15;   // let the detector settle on the new frequency
+    harshUntil_ = harshFrom_ + 3.0;
+    harshMax_ = -200.0f;
+    toast(fmt("%.0f harsh hits", n) + fmt(" around %.1f kHz - listening 3 s to set THRESHOLD (keep it playing)", harshHz_ / 1000.0));
+}
+
+void App::updateFindHarsh() {
+    if (harshStem_ < 0 || now() < harshUntil_) return;
+    const int s = harshStem_;
+    harshStem_ = -1;
+    DeEsserProcessor* d = slots_[static_cast<std::size_t>(s)].dess;
+    if (!d || !slots_[static_cast<std::size_t>(s)].loaded) return;
+    if (harshMax_ < -70.0f) { toast("Too quiet to set a threshold - play the harsh part and click FIND HARSH again"); return; }
+    const float thr = clampf(std::round((harshMax_ - 10.0f) * 2.0f) * 0.5f, -60.0f, -6.0f);
+    d->param(DeEsserProcessor::kThresh).set(thr);
+    d->setBypassed(false);
+    toast(fmt("De-esser ON: %.1f kHz", d->param(DeEsserProcessor::kFreq).target() / 1000.0) + fmt(", threshold %.1f dB", thr) +
+          fmt(" (loudest hit %.1f dB). Too much? Turn MAX CUT down.", harshMax_));
+}
+
+// ------------------------------------------------------------------ 3D SCOPE
+// The selected stem as a lit 3D landscape: newest sound in front, ~2.3 s going back, bass left, highs right,
+// height + colour = level. The range follows the stem (top of the box = its loudest point), so a quiet
+// tambourine fills the box as well as a loud vocal. Harsh hits get red pins; a ring gets a magenta curtain.
+// Drag to turn, double-click to reset. Built from the 3D landscape in THE HYBRID CORE's ANALYZER.
+namespace scope3d {
+constexpr int   kRows = Spectrogram::kLRows, kPts = Spectrogram::kLPts;
+constexpr float kXW = 1.6f, kZD = 2.4f, kH = 0.95f, kCamD = 5.6f, kRange = 72.0f;
+
+struct Rgb { float r, g, b; };
+inline Rgb rgbOf(std::uint32_t v) { return {((v >> 16) & 0xFF) / 255.0f, ((v >> 8) & 0xFF) / 255.0f, (v & 0xFF) / 255.0f}; }
+inline Color colorOf(Rgb c, float a) {
+    auto b = [](float v) { return static_cast<std::uint32_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); };
+    return Color((b(c.r) << 24) | (b(c.g) << 16) | (b(c.b) << 8) | b(a));
+}
+inline Rgb mixRgb(Rgb a, Rgb b, float t) { return {a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t}; }
+// Deep violet -> magenta -> orange -> gold -> white.
+inline Rgb heatRgb(float t) {
+    static const std::uint32_t stops[] = {0x0D0520, 0x3B0F70, 0x8C2981, 0xDE4968, 0xFE9F6D, 0xFDE68A, 0xFFFFFF};
+    t = std::clamp(t, 0.0f, 1.0f) * 6.0f;
+    const int i = std::min(static_cast<int>(t), 5);
+    return mixRgb(rgbOf(stops[i]), rgbOf(stops[i + 1]), t - static_cast<float>(i));
+}
+struct Projector {
+    float cy, sy, cp, sp, scale = 1, ox = 0, oy = 0;
+    Projector(float yaw, float pitch, const Rect& view) {
+        cy = std::cos(yaw); sy = std::sin(yaw); cp = std::cos(pitch); sp = std::sin(pitch);
+        float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+        for (float x : {-kXW - 0.2f, kXW + 0.2f})
+            for (float y : {0.0f, kH * 1.15f})
+                for (float z : {-0.55f, kZD}) {
+                    float u, v, d;
+                    raw(x, y, z, u, v, d);
+                    x0 = std::min(x0, u); x1 = std::max(x1, u); y0 = std::min(y0, v); y1 = std::max(y1, v);
+                }
+        scale = std::min(view.w() / (x1 - x0), view.h() / (y1 - y0)) * 0.97f;
+        ox = view.cx() - scale * 0.5f * (x0 + x1);
+        oy = view.cy() - scale * 0.5f * (y0 + y1);
+    }
+    void raw(float x, float y, float z, float& u, float& v, float& depth) const {
+        const float ry = y - kH * 0.3f, rz0 = z - kZD * 0.5f;
+        const float rx = x * cy + rz0 * sy, rz = -x * sy + rz0 * cy;
+        const float up = ry * cp + rz * sp;
+        depth = rz * cp - ry * sp + kCamD;
+        u = rx / depth * kCamD;
+        v = -up / depth * kCamD;
+    }
+    void operator()(float x, float y, float z, float& sx, float& sy_) const {
+        float u, v, d;
+        raw(x, y, z, u, v, d);
+        sx = ox + u * scale; sy_ = oy + v * scale;
+    }
+    float depth(float x, float y, float z) const { float u, v, d; raw(x, y, z, u, v, d); return d; }
+};
+inline float pointX(int i) { return -kXW + 2.0f * kXW * static_cast<float>(i) / (kPts - 1); }
+inline float freqX(float hz) { return -kXW + 2.0f * kXW * std::log(hz / 30.0f) / std::log(20000.0f / 30.0f); }
+inline float rowZ(int age) { return kZD * static_cast<float>(age) / (kRows - 1); }
+} // namespace scope3d
+
+void App::drawScope3D(float ox, float oy) {
+    using namespace scope3d;
+    const Spectrogram& sp = spec_;
+    const Rect panel{ox + 6, oy + 34, ox + 713, oy + 449};
+    gfx_.roundRect({panel.x0, panel.y0 + 3, panel.x1, panel.y1 + 4}, 14, 0x000000B0);
+    gfx_.roundRect(panel, 14, 0x2E363EFF);
+    gfx_.roundRect(panel.inset(2), 12, 0x070B12FF);
+    gfx_.gradientV({panel.x0 + 3, panel.y0 + 3, panel.x1 - 3, panel.y0 + 200}, 0x101A2CFF, 0x070B1200);
+    gfx_.text(ox + 30, oy + 44, "HEM", Font::Large, kText);
+    gfx_.text(ox + 30 + gfx_.textWidth("HEM ", Font::Large), oy + 44, "3D SCOPE", Font::Large, kCyan);
+    const std::string nm = sel().loaded ? shownName(selected_) : std::string("no stem");
+    gfx_.text(ox + 690 - gfx_.textWidth(nm, Font::Small), oy + 50, nm, Font::Small, kText);
+
+    const Rect view{ox + 14, oy + 84, ox + 705, oy + 398};
+    // Turn: drag (only when this screen fills the window), double-click resets.
+    if (focus_ == DK::kDestroyer) {
+        const bool hot = view.contains(in_.mx, in_.my);
+        if (hot) hotId_ = 4700;
+        if (hot && in_.dbl) { scopeYaw_ = 0.32f; scopePitch_ = 0.52f; activeId_ = 0; }
+        else if (hot && in_.pressed) { activeId_ = 4700; dragStartX_ = in_.devX; dragStartY_ = in_.devY; scopeYaw0_ = scopeYaw_; scopePitch0_ = scopePitch_; }
+        if (activeId_ == 4700) {
+            if (in_.down) {
+                scopeYaw_ = clampf(scopeYaw0_ + (in_.devX - dragStartX_) * 0.004f, -0.9f, 0.9f);
+                scopePitch_ = clampf(scopePitch0_ + (in_.devY - dragStartY_) * 0.003f, 0.12f, 1.15f);
+            }
+            if (in_.released) activeId_ = 0;
+        }
+    }
+    const Projector P(scopeYaw_, scopePitch_, view);
+
+    // Auto range: the top of the box follows the loudest point of the last 2.3 s (fast up, slow down).
+    float loud = -140.0f;
+    for (int a = 0; a < kRows; ++a) { const float* r = sp.landRow(a); for (int i = 0; i < kPts; ++i) loud = std::max(loud, r[i]); }
+    const float want = clampf(loud + 3.0f, -60.0f, 3.0f);
+    scopeTop_ = want > scopeTop_ ? scopeTop_ + (want - scopeTop_) * 0.35f : scopeTop_ + (want - scopeTop_) * 0.02f;
+    const float lo = scopeTop_ - kRange;
+    const auto levelT = [&](float db) { return clampf((db - lo) / kRange, 0.0f, 1.0f); };
+    const auto heightOf = [&](float t) { return kH * std::pow(t, 1.35f); };
+
+    // Heights and levels of the grid (row 0 = newest).
+    static std::vector<float> T, Hh;
+    static std::vector<Color> C;
+    static std::vector<float> SX, SY;
+    T.assign(static_cast<std::size_t>(kRows) * kPts, 0.0f);
+    Hh.assign(T.size(), 0.0f);
+    for (int a = 0; a < kRows; ++a) {
+        const float* r = sp.landRow(a);
+        for (int i = 0; i < kPts; ++i) {
+            const float t = levelT(r[i]);
+            T[static_cast<std::size_t>(a * kPts + i)] = t;
+            Hh[static_cast<std::size_t>(a * kPts + i)] = heightOf(t);
+        }
+    }
+    const auto h = [&](int a, int i) { a = std::clamp(a, 0, kRows - 1); i = std::clamp(i, 0, kPts - 1); return Hh[static_cast<std::size_t>(a * kPts + i)]; };
+    // Lighting: key light from the upper left (the desk lamp side), Blinn-Phong sheen, valleys darkened,
+    // haze toward the back. Harsh rows turn red in the highs.
+    const float dx = 2.0f * kXW / (kPts - 1), dz = kZD / (kRows - 1);
+    float Lx = -0.45f, Ly = 0.80f, Lz = -0.40f;
+    { const float l = std::sqrt(Lx * Lx + Ly * Ly + Lz * Lz); Lx /= l; Ly /= l; Lz /= l; }
+    float Hx = Lx, Hy = Ly + 0.45f, Hz = Lz - 0.89f;
+    { const float l = std::sqrt(Hx * Hx + Hy * Hy + Hz * Hz); Hx /= l; Hy /= l; Hz /= l; }
+    const Rgb fog = rgbOf(0x070B14), red = rgbOf(0xFF3B1E);
+    C.assign(T.size(), Color(0));
+    SX.assign(T.size(), 0.0f); SY.assign(T.size(), 0.0f);
+    const int i4k = std::clamp(static_cast<int>(std::lround(std::log(4000.0f / 30.0f) / std::log(20000.0f / 30.0f) * (kPts - 1))), 0, kPts - 1);
+    for (int a = 0; a < kRows; ++a) {
+        const bool harsh = sp.landHarsh[sp.landIdx(a)] != 0;
+        for (int i = 0; i < kPts; ++i) {
+            const std::size_t k = static_cast<std::size_t>(a * kPts + i);
+            const float gx = (h(a, i + 1) - h(a, i - 1)) / (2.0f * dx), gz = (h(a + 1, i) - h(a - 1, i)) / (2.0f * dz);
+            const float nl = std::sqrt(gx * gx + 1.0f + gz * gz);
+            const float nx = -gx / nl, ny = 1.0f / nl, nz = -gz / nl;
+            const float diff = std::max(0.0f, nx * Lx + ny * Ly + nz * Lz);
+            const float spec = std::pow(std::max(0.0f, nx * Hx + ny * Hy + nz * Hz), 30.0f) * (0.25f + 0.75f * T[k]);
+            const float around = 0.25f * (h(a, i - 1) + h(a, i + 1) + h(a - 1, i) + h(a + 1, i));
+            const float ao = clampf(1.0f - (around - Hh[k]) * 2.2f, 0.55f, 1.0f);
+            Rgb c = heatRgb(0.06f + 0.94f * T[k]);
+            if (harsh && i >= i4k) c = mixRgb(c, red, 0.35f + 0.5f * T[k]);
+            const float lit = (0.38f + 0.82f * diff) * ao;
+            c = {c.r * lit + spec * 0.95f, c.g * lit + spec * 0.85f, c.b * lit + spec * 0.65f};
+            c = mixRgb(c, fog, 0.72f * static_cast<float>(a) / (kRows - 1));
+            C[k] = colorOf(c, 0.98f);
+            P(pointX(i), Hh[k], rowZ(a), SX[k], SY[k]);
+        }
+    }
+
+    // ---- floor, apron (front lip with the reflection), back wall, grid
+    const auto line3 = [&](float x0, float y0, float z0, float x1, float y1, float z1, float w, Color c) {
+        float a0, b0, a1, b1;
+        P(x0, y0, z0, a0, b0); P(x1, y1, z1, a1, b1);
+        gfx_.line(a0, b0, a1, b1, w, c);
+    };
+    {
+        float q[8];
+        const Color wall[4] = {0x0A1222F0, 0x0A1222F0, 0x05081280, 0x05081280};
+        P(-kXW, 0, kZD, q[0], q[1]); P(kXW, 0, kZD, q[2], q[3]); P(kXW, kH, kZD, q[4], q[5]); P(-kXW, kH, kZD, q[6], q[7]);
+        gfx_.quadC(q, wall);
+        const Color fl[4] = {0x0F1B30F8, 0x0F1B30F8, 0x060A12F8, 0x060A12F8};
+        P(-kXW, 0, 0, q[0], q[1]); P(kXW, 0, 0, q[2], q[3]); P(kXW, 0, kZD, q[4], q[5]); P(-kXW, 0, kZD, q[6], q[7]);
+        gfx_.quadC(q, fl);
+        const Color ap[4] = {0x0B1424FF, 0x0B1424FF, 0x14223AFF, 0x14223AFF};
+        P(-kXW, 0, -0.5f, q[0], q[1]); P(kXW, 0, -0.5f, q[2], q[3]); P(kXW, 0, 0, q[4], q[5]); P(-kXW, 0, 0, q[6], q[7]);
+        gfx_.quadC(q, ap);
+        // Reflection of the newest slice on the glossy apron.
+        for (int i = 0; i < kPts - 1; ++i) {
+            const float h0 = Hh[static_cast<std::size_t>(i)] * 0.22f, h1 = Hh[static_cast<std::size_t>(i + 1)] * 0.22f;
+            if (h0 + h1 <= 0.002f) continue;
+            P(pointX(i), 0, -0.002f, q[0], q[1]); P(pointX(i + 1), 0, -0.002f, q[2], q[3]);
+            P(pointX(i + 1), 0, -h1, q[4], q[5]); P(pointX(i), 0, -h0, q[6], q[7]);
+            const Rgb c0 = heatRgb(0.1f + 0.9f * T[static_cast<std::size_t>(i)]), c1 = heatRgb(0.1f + 0.9f * T[static_cast<std::size_t>(i + 1)]);
+            const Color rc[4] = {colorOf(c0, 0.22f), colorOf(c1, 0.22f), colorOf(c1, 0.0f), colorOf(c0, 0.0f)};
+            gfx_.quadC(q, rc);
+        }
+        for (float hz : {50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f}) {
+            const float x = freqX(hz);
+            line3(x, 0, 0, x, 0, kZD, 1.0f, Color(0x3FD0FF2A));
+            line3(x, 0, kZD, x, kH, kZD, 1.0f, Color(0x3FD0FF1A));
+        }
+        for (int k = 0; k <= 4; ++k) line3(-kXW, 0, kZD * k / 4.0f, kXW, 0, kZD * k / 4.0f, 1.0f, Color(k == 0 ? 0x3FD0FF60 : 0x3FD0FF22));
+        for (int k = 0; k <= 3; ++k) {   // level lines on the back wall, every 24 dB under the top
+            const float db = scopeTop_ - 24.0f * k;
+            const float y = heightOf(levelT(db));
+            line3(-kXW, y, kZD, kXW, y, kZD, 1.0f, Color(k == 0 ? 0x3FD0FF55 : 0x3FD0FF22));
+            float lx, ly;
+            P(-kXW - 0.03f, y, kZD, lx, ly);
+            const std::string t = fmt("%.0f dB", db);
+            gfx_.text(lx - gfx_.textWidth(t, Font::Small) - 4, ly - 8, t, Font::Small, Color(kDim).alpha(0.85f));
+        }
+    }
+
+    // ---- the landscape, back to front (painter's order), far side first.
+    const bool leftFar = P.depth(-kXW, 0, kZD * 0.5f) > P.depth(kXW, 0, kZD * 0.5f);
+    for (int a = kRows - 2; a >= 0; --a) {
+        for (int k = 0; k < kPts - 1; ++k) {
+            const int i = leftFar ? k : kPts - 2 - k;
+            const std::size_t b0 = static_cast<std::size_t>((a + 1) * kPts + i), b1 = b0 + 1, f0 = static_cast<std::size_t>(a * kPts + i), f1 = f0 + 1;
+            if (T[b0] + T[b1] + T[f0] + T[f1] <= 0.0f) continue;   // flat: the floor shows through
+            const float q[8] = {SX[b0], SY[b0], SX[b1], SY[b1], SX[f1], SY[f1], SX[f0], SY[f0]};
+            const Color cs[4] = {C[b0], C[b1], C[f1], C[f0]};
+            gfx_.quadC(q, cs);
+        }
+        if ((sp.landRows + static_cast<std::uint64_t>(kRows) * 1000 - static_cast<std::uint64_t>(a)) % 6 == 0) {   // contour every 6th row
+            float xy[2 * kPts];
+            for (int i = 0; i < kPts; ++i) P(pointX(i), h(a, i) + 0.004f, rowZ(a), xy[2 * i], xy[2 * i + 1]);
+            gfx_.polyline(xy, kPts, 1.0f, Color(0xFDE68AFF).alpha(0.16f * (1.0f - static_cast<float>(a) / kRows)));
+        }
+    }
+    // Front face (newest slice down to the floor) and the lit ridge.
+    {
+        for (int i = 0; i < kPts - 1; ++i) {
+            if (T[static_cast<std::size_t>(i)] + T[static_cast<std::size_t>(i + 1)] <= 0.0f) continue;
+            float q[8];
+            P(pointX(i), Hh[static_cast<std::size_t>(i)], 0, q[0], q[1]); P(pointX(i + 1), Hh[static_cast<std::size_t>(i + 1)], 0, q[2], q[3]);
+            P(pointX(i + 1), 0, 0, q[4], q[5]); P(pointX(i), 0, 0, q[6], q[7]);
+            const Rgb t0 = heatRgb(0.1f + 0.9f * T[static_cast<std::size_t>(i)]), t1 = heatRgb(0.1f + 0.9f * T[static_cast<std::size_t>(i + 1)]);
+            const Color cs[4] = {colorOf({t0.r * 0.6f, t0.g * 0.6f, t0.b * 0.6f}, 0.97f), colorOf({t1.r * 0.6f, t1.g * 0.6f, t1.b * 0.6f}, 0.97f), 0x05070DF8, 0x05070DF8};
+            gfx_.quadC(q, cs);
+        }
+        float xy[2 * kPts];
+        for (int i = 0; i < kPts; ++i) P(pointX(i), Hh[static_cast<std::size_t>(i)], 0, xy[2 * i], xy[2 * i + 1]);
+        gfx_.polyline(xy, kPts, 5.0f, Color(0xFFB86B40));
+        gfx_.polyline(xy, kPts, 2.0f, Color(0xFFF1C8F0));
+    }
+
+    // ---- ring: a magenta curtain along time at the ringing pitch.
+    const bool ringOn = sp.ringScore >= 8.0f && sp.ringHz > 0.0f;
+    if (ringOn) {
+        const float x = freqX(sp.ringHz);
+        const int pi = std::clamp(static_cast<int>(std::lround((x + kXW) / (2.0f * kXW) * (kPts - 1))), 0, kPts - 1);
+        const float a = clampf((sp.ringScore - 6.0f) / 14.0f, 0.3f, 1.0f);
+        float q[8];
+        P(x, 0, 0, q[0], q[1]); P(x, 0, kZD, q[2], q[3]); P(x, kH * 1.1f, kZD, q[4], q[5]); P(x, kH * 1.1f, 0, q[6], q[7]);
+        const Color cc[4] = {Color(0xFF3BD4FF).alpha(0.22f * a), Color(0xFF3BD4FF).alpha(0.05f * a), Color(0xFF3BD4FF).alpha(0.0f), Color(0xFF3BD4FF).alpha(0.0f)};
+        gfx_.quadC(q, cc);
+        float xy[2 * kRows];
+        for (int r = 0; r < kRows; ++r) P(x, h(r, pi) + 0.01f, rowZ(r), xy[2 * r], xy[2 * r + 1]);
+        gfx_.polyline(xy, kRows, 4.0f, Color(0xFF3BD4FF).alpha(0.3f * a));
+        gfx_.polyline(xy, kRows, 1.8f, Color(0xFF9BEAFF).alpha(a));
+        float lx, ly;
+        P(x, kH * 1.1f, 0, lx, ly);
+        const std::string t = sp.ringHz >= 1000 ? fmt("RING %.2f kHz", sp.ringHz / 1000.0) : fmt("RING %.0f Hz", sp.ringHz);
+        const float w = gfx_.textWidth(t, Font::Small);
+        gfx_.roundRect({lx - w * 0.5f - 6, ly - 22, lx + w * 0.5f + 6, ly - 2}, 5, 0x1A0616E0);
+        gfx_.text(lx - w * 0.5f, ly - 21, t, Font::Small, Color(0xFF9BEAFF));
+    }
+    // ---- harsh hits: a red pin over each hit, at its pitch.
+    for (int a = 0; a < kRows; ++a) {
+        const int idx = sp.landIdx(a);
+        if (!sp.landHarsh[idx]) continue;
+        const float x = freqX(std::max(30.0f, sp.landHarshHz[idx]));
+        const int pi = std::clamp(static_cast<int>(std::lround((x + kXW) / (2.0f * kXW) * (kPts - 1))), 0, kPts - 1);
+        const float y0 = h(a, pi), y1 = y0 + 0.22f;
+        const float fade = 1.0f - 0.6f * static_cast<float>(a) / kRows;
+        float x0s, y0s, x1s, y1s;
+        P(x, y0, rowZ(a), x0s, y0s);
+        P(x, y1, rowZ(a), x1s, y1s);
+        gfx_.line(x0s, y0s, x1s, y1s, 1.6f, Color(0xFF6A3CFF).alpha(0.8f * fade));
+        const float r = 4.5f * fade + 1.5f;
+        gfx_.triangle(x1s - r, y1s, x1s + r, y1s, x1s, y1s - r * 1.3f, Color(0xFF3B1EFF).alpha(fade));
+        gfx_.triangle(x1s - r, y1s, x1s + r, y1s, x1s, y1s + r * 1.3f, Color(0xFFB08AFF).alpha(fade));
+    }
+
+    // ---- axis labels
+    for (const auto& [hz, name] : {std::pair{50.0f, "50"}, {100.0f, "100"}, {200.0f, "200"}, {500.0f, "500"}, {1000.0f, "1k"},
+                                   {2000.0f, "2k"}, {5000.0f, "5k"}, {10000.0f, "10k"}}) {
+        float sx, sy;
+        P(freqX(hz), 0, -0.5f, sx, sy);
+        gfx_.text(sx - gfx_.textWidth(name, Font::Small) * 0.5f, sy + 2, name, Font::Small, Color(kDim).alpha(0.9f));
+    }
+    {
+        float sx, sy;
+        P(kXW + 0.06f, 0, 0, sx, sy);
+        gfx_.text(sx, sy - 8, "NOW", Font::Small, Color(0xFFE2A8FF));
+        P(kXW + 0.06f, 0, kZD, sx, sy);
+        gfx_.text(sx, sy - 8, fmt("%.1f s", kRows * Spectrogram::kLSub * Spectrogram::kHop / sr_), Font::Small, kDim);
+    }
+
+    // ---- bottom bar: what it found, and the fixes
+    const int hits10 = sp.hitsWithin(10.0);
+    const float hz10 = sp.hitHzWithin(10.0);
+    {
+        const Rect chip{ox + 20, oy + 404, ox + 262, oy + 436};
+        gfx_.roundRect(chip, 7, hits10 ? Color(0x3A1206F0) : Color(0x0B1018E0));
+        gfx_.rectOutline(chip, Color(0xFF5A2AFF).alpha(hits10 ? 0.8f : 0.25f), 1.2f);
+        gfx_.triangle(chip.x0 + 12, chip.cy(), chip.x0 + 20, chip.cy(), chip.x0 + 16, chip.cy() - 7, 0xFF3B1EFF);
+        gfx_.triangle(chip.x0 + 12, chip.cy(), chip.x0 + 20, chip.cy(), chip.x0 + 16, chip.cy() + 7, 0xFFB08AFF);
+        const std::string t = hits10 ? fmt("HARSH HITS %.0f", hits10) + fmt("  ~%.1f kHz", hz10 / 1000.0) : std::string("HARSH HITS  none");
+        gfx_.text(chip.x0 + 28, chip.y0 + 7, t, Font::Small, hits10 ? Color(0xFFC0A0FF) : kDim);
+        const Rect tb{ox + 268, oy + 404, ox + 384, oy + 436};
+        if (button(4701, tb)) { screenTab_[DK::kResonance] = 1; findHarsh(); }
+        gfx_.roundRect(tb, 7, harshStem_ == selected_ ? Color(kYellow).alpha(0.85f) : Color(0x05080BE0));
+        gfx_.rectOutline(tb, Color(kOrange).alpha(hotId_ == 4701 ? 0.95f : 0.55f), 1.4f);
+        gfx_.textIn(tb, "TAME IT", Font::Small, harshStem_ == selected_ ? Color(0x140800FF) : kText);
+        if (hotId_ == 4701) { tooltip_ = "While it plays: the De-esser (RESONANCE screen) finds the harsh hits and turns them down"; tipX_ = tb.cx(); tipY_ = tb.y0 - 4; tipSec_ = curSec_; }
+    }
+    {
+        const Rect chip{ox + 398, oy + 404, ox + 584, oy + 436};
+        gfx_.roundRect(chip, 7, ringOn ? Color(0x2A0626F0) : Color(0x0B1018E0));
+        gfx_.rectOutline(chip, Color(0xFF3BD4FF).alpha(ringOn ? 0.8f : 0.25f), 1.2f);
+        const std::string t = ringOn ? (sp.ringHz >= 1000 ? fmt("RING %.2f kHz", sp.ringHz / 1000.0) : fmt("RING %.0f Hz", sp.ringHz)) : std::string("RING  none");
+        gfx_.text(chip.x0 + 12, chip.y0 + 7, t, Font::Small, ringOn ? Color(0xFF9BEAFF) : kDim);
+        const Rect cb{ox + 590, oy + 404, ox + 700, oy + 436};
+        if (button(4702, cb)) { findPing(); screenTab_[DK::kDestroyer] = 2; }
+        gfx_.roundRect(cb, 7, Color(0x05080BE0));
+        gfx_.rectOutline(cb, Color(0xFF3BD4FF).alpha(hotId_ == 4702 ? 0.95f : 0.55f), 1.4f);
+        gfx_.textIn(cb, "CUT IT", Font::Small, kText);
+        if (hotId_ == 4702) { tooltip_ = "While it rings: the EQ (EQ tab) cuts the ringing tone 9 dB"; tipX_ = cb.cx() - 100; tipY_ = cb.y0 - 4; tipSec_ = curSec_; }
+    }
+    if (focus_ == DK::kDestroyer && !sel().loaded)
+        gfx_.textIn(view, "Load stems and press play", Font::Normal, kDim);
+    else if (focus_ == DK::kDestroyer)
+        gfx_.text(view.x0 + 6, view.y0 + 2, "DRAG TO TURN  /  DOUBLE-CLICK TO RESET", Font::Small, Color(kDim).alpha(0.6f));
 }
 
 // ====================================================================================== the desk
@@ -2445,7 +3001,7 @@ void App::drawScreen(int i) {
     if (sc.skin.w() > 0 && tab == 0) gfx_.image(1, sc.skin, sc.src);
     const float ox = sc.src.x0, oy = sc.src.y0;
     switch (i) {
-    case DK::kDestroyer: if (tab == 0) drawDestroyer(); else drawEqPanel(ox, oy); break;
+    case DK::kDestroyer: if (tab == 0) drawDestroyer(); else if (tab == 1) drawEqPanel(ox, oy); else drawScope3D(ox, oy); break;
     case DK::kResonance: if (tab == 0) drawResonance(); else drawDeEssPanel(ox, oy); break;
     case DK::kTransient: if (tab == 0) drawTransient(); else if (tab == 1) drawCompPanel(ox, oy); else drawGatePanel(ox, oy); break;
     case DK::kMastering: drawMastering(); break;
@@ -2456,10 +3012,10 @@ void App::drawScreen(int i) {
     // The three per-stem screens show (and, in focus, pick) the stem they work on.
     if (i == DK::kDestroyer || i == DK::kResonance || i == DK::kTransient) {
         setSection(secs[i]);
-        static const char* t0[] = {"DESTROYER", "EQ"};
+        static const char* t0[] = {"DESTROYER", "EQ", "3D"};
         static const char* t2[] = {"RESONANCE", "DE-ESSER"};
         static const char* t3[] = {"TRANSIENT", "COMP", "GATE"};
-        if (i == DK::kDestroyer) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t0, 2);
+        if (i == DK::kDestroyer) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t0, 3);
         else if (i == DK::kResonance) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t2, 2);
         else drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t3, 3);
         // (The stem picker sits in the top bar while this screen is open — see drawDeskChrome.)

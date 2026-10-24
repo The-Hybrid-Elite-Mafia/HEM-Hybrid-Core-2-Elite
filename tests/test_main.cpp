@@ -436,6 +436,38 @@ static void testDeEsser() {
     const double ch200 = toneDb(L2, a, b, 200, sr) - toneDb(mix, a, b, 200, sr);
     check(cut8k > 8.0 && cut8k <= 12.5, "De-esser: loud 8 kHz pulled down (dB, Max Cut 12, shelf at 5 kHz)", cut8k, "dB");
     check(std::fabs(ch200) < 0.5, "De-esser: 200 Hz body unchanged (level change)", ch200, "dB");
+    {
+        const float cut = d2.takeCutPeakDb();
+        check(cut > 8.0f && cut <= 12.01f, "De-esser: cut meter holds the biggest cut since the UI last read it (dB)", cut, "dB");
+        check(d2.takeCutPeakDb() == 0.0f, "De-esser: reading the cut meter resets it (dB after read)", d2.takeCutPeakDb(), "dB");
+    }
+
+    // 3. OFF: the audio is untouched, but the "sss" level is still measured (so THRESHOLD can be set first).
+    DeEsserProcessor d3;
+    d3.param(DeEsserProcessor::kFreq).set(5000);
+    d3.setBypassed(true);
+    d3.prepare(sr, 256);
+    std::vector<float> L3 = mix, R3 = mix;
+    long allocs3 = -1;
+    runStereo(d3, L3, R3, 256, &allocs3);
+    double err3 = 0; for (std::size_t i = 0; i < n; ++i) err3 = std::max(err3, double(std::fabs(L3[i] - mix[i])));
+    check(err3 == 0.0, "De-esser OFF: output equals the input exactly (max error)", err3);
+    check(allocs3 == 0, "De-esser OFF: no memory allocation while metering", double(allocs3));
+    const float lv = d3.takeLevelPeakDb();
+    check(lv > -8.0f && lv < -4.0f, "De-esser OFF: meter reads the 8 kHz 'sss' level (0.5 peak, about -7 dBFS)", lv, "dBFS");
+    check(d3.takeCutPeakDb() == 0.0f, "De-esser OFF: cut meter stays at 0 dB", 0.0);
+
+    // 4. A 5 ms burst between two screen frames is still caught by the held meters.
+    DeEsserProcessor d4;
+    d4.param(DeEsserProcessor::kFreq).set(5000); d4.param(DeEsserProcessor::kThresh).set(-30);
+    d4.prepare(sr, 256);
+    std::vector<float> burst(n, 0.0f);
+    for (std::size_t i = 24000; i < 24240; ++i) burst[i] = 0.5f * std::sin(float(2 * kPi * 9000.0 * double(i) / sr));
+    std::vector<float> L4 = burst, R4 = burst;
+    runStereo(d4, L4, R4, 256, nullptr);   // the burst is ~0.5 s before the end: the live value is back to 0
+    const float lv4 = d4.takeLevelPeakDb(), cut4 = d4.takeCutPeakDb();
+    check(lv4 > -12.0f, "De-esser: 5 ms burst caught by the held level meter (dBFS)", lv4, "dBFS");
+    check(cut4 > 3.0f, "De-esser: 5 ms burst caught by the held cut meter (dB)", cut4, "dB");
 }
 
 static void benchEngine() {

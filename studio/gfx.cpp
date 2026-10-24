@@ -411,6 +411,13 @@ void Renderer::rectOutline(const Rect& r, Color c, float t) {
     rect({r.x1 - t, r.y0 + t, r.x1, r.y1 - t}, c);
 }
 
+void Renderer::quadC(const float* xy, const Color* c) {
+    const float x0 = X(xy[0]), y0 = Y(xy[1]), x1 = X(xy[2]), y1 = Y(xy[3]), x2 = X(xy[4]), y2 = Y(xy[5]), x3 = X(xy[6]), y3 = Y(xy[7]);
+    const auto c0 = pack(c[0]), c1 = pack(c[1]), c2 = pack(c[2]), c3 = pack(c[3]);
+    triC(x0, y0, c0, x1, y1, c1, x2, y2, c2);
+    triC(x0, y0, c0, x2, y2, c2, x3, y3, c3);
+}
+
 void Renderer::gradientV(const Rect& r, Color top, Color bottom) {
     const float x0 = X(r.x0), y0 = Y(r.y0), x1 = X(r.x1), y1 = Y(r.y1);
     const auto a = pack(top), b = pack(bottom);

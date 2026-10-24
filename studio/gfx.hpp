@@ -98,6 +98,8 @@ public:
     void ring(float cx, float cy, float r, float t, Color c) { arc(cx, cy, r, 0.0f, 6.2831853f, t, c); }
     // Filled polygon below a curve down to baseline y (for spectra).
     void fillUnder(const float* xy, std::size_t n, float baseY, Color top, Color bottom);
+    // Filled quad with a colour per corner (corners in order around the edge; for 3D surfaces).
+    void quadC(const float* xy, const Color* c);
 
     // ---- text (IMAGE coordinates; sizes are image px) ----
     float textWidth(std::string_view s, Font f) const;
