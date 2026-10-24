@@ -287,7 +287,8 @@ private:
     void drawDesk();          // desk picture + glass of every monitor (before the screens)
     void drawDeskChrome();    // hover / click on the desk, masks and the screen bar (after the screens)
     void drawNowPlaying();
-    void drawStemPicker(int idBase, float x0, float y0, float h);
+    void drawStemPicker(int idBase, float x0, float y0, float h, float maxW = 1.0e9f);
+    float tabsX0_ = 0;   // left edge of the last tab row drawn (so the stem picker stops before it)
     // Plug-in tabs on the per-stem monitors: DESTROYER | EQ, RESONANCE | DE-ESSER, TRANSIENT | COMP | GATE.
     int screenTab_[DK::kNumScreens] = {};
     int drawTabs(int screen, float x1, float y0, const char* const* names, int n);
@@ -2092,6 +2093,7 @@ int App::drawTabs(int screen, float x1, float y0, const char* const* names, int 
         gfx_.textIn(r, names[t], Font::Small, on ? Color(0x041016FF) : kText);
         x = r.x0 - gap;
     }
+    tabsX0_ = x + gap;
     return screenTab_[screen];
 }
 
@@ -2449,13 +2451,13 @@ void App::drawScreen(int i) {
     // The three per-stem screens show (and, in focus, pick) the stem they work on.
     if (i == DK::kDestroyer || i == DK::kResonance || i == DK::kTransient) {
         setSection(secs[i]);
-        drawStemPicker(9100 + 10 * i, sc.src.x0 + 12, sc.src.y0 + 3, 27);
         static const char* t0[] = {"DESTROYER", "EQ"};
         static const char* t2[] = {"RESONANCE", "DE-ESSER"};
         static const char* t3[] = {"TRANSIENT", "COMP", "GATE"};
         if (i == DK::kDestroyer) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t0, 2);
         else if (i == DK::kResonance) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t2, 2);
         else drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t3, 3);
+        drawStemPicker(9100 + 10 * i, sc.src.x0 + 12, sc.src.y0 + 3, 27, tabsX0_ - 10 - (sc.src.x0 + 12));
     }
 }
 
@@ -2543,11 +2545,11 @@ void App::drawDeskChrome() {
 
 // Per-stem screens (DESTROYER / RESONANCE / TRANSIENT), top-left: which stem the screen works on, with < >
 // to step through the loaded stems (empty slots are skipped). Same stem as the one selected on CONSOLE.
-void App::drawStemPicker(int idBase, float x0, float y0, float h) {
+void App::drawStemPicker(int idBase, float x0, float y0, float h, float maxW) {
     std::vector<int> loaded;
     for (int i = 0; i < static_cast<int>(kNumStems); ++i) if (slots_[static_cast<std::size_t>(i)].loaded) loaded.push_back(i);
     const float aw = h + 8;   // arrow button width
-    const float nw = gfx_.textWidth("STEM 13 - PERCUSSION", Font::Small) + 30;
+    const float nw = std::max(60.0f, std::min(gfx_.textWidth("STEM 13 - PERCUSSION", Font::Small) + 30, maxW - 2 * aw - 8));
     const Rect prev{x0, y0, x0 + aw, y0 + h};
     const Rect box{prev.x1 + 4, y0, prev.x1 + 4 + nw, y0 + h};
     const Rect next{box.x1 + 4, y0, box.x1 + 4 + aw, y0 + h};
