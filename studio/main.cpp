@@ -326,6 +326,7 @@ struct Slot {
     CompProcessor* comp = nullptr;
     GateProcessor* gate = nullptr;
     DeEsserProcessor* dess = nullptr;
+    EveryHitProcessor* eh = nullptr;
     StemMeterSnapshot meter;
     float dotLevel = 0;
 };
@@ -477,6 +478,11 @@ private:
     int harshHits_ = 0;
     std::uint64_t harshCol_ = 0;   // spectrogram frame when FIND HARSH was clicked
     void findHarsh();
+    // EVERY HIT (RESONANCE screen, third tab): cuts every tambourine / hat / "sss" hit by the same amount.
+    std::array<float, kNumStems> ehCut_{};
+    std::array<double, kNumStems> ehCutT_{}, ehHitT_{};
+    std::array<std::uint64_t, kNumStems> ehHits_{};
+    void drawEveryHitPanel(float ox, float oy);
     void updateFindHarsh();
     // 3D SCOPE (DESTROYER screen, third tab): the selected stem as a lit 3D landscape, harsh hits and rings marked.
     float scopeYaw_ = 0.26f, scopePitch_ = 0.40f, scopeYaw0_ = 0, scopePitch0_ = 0;
@@ -766,12 +772,13 @@ StripState App::stripOf(int s) const {
 ChainState App::captureStem(int s) const {
     const Slot& sl = slots_[static_cast<std::size_t>(s)];
     ChainState c;
-    // Chain order (the order the audio goes through): Gate, Destroyer, Resonance, EQ, De-esser, Comp, Transient.
+    // Chain order (the order the audio goes through): Gate, Destroyer, Resonance, EQ, De-esser, Every Hit, Comp, Transient.
     if (sl.gate) c.push_back(captureProc(*sl.gate));
     if (sl.ds) c.push_back(captureProc(*sl.ds));
     if (sl.rs) c.push_back(captureProc(*sl.rs));
     if (sl.eq) c.push_back(captureProc(*sl.eq));
     if (sl.dess) c.push_back(captureProc(*sl.dess));
+    if (sl.eh) c.push_back(captureProc(*sl.eh));
     if (sl.comp) c.push_back(captureProc(*sl.comp));
     if (sl.tr) c.push_back(captureProc(*sl.tr));
     return c;
@@ -788,7 +795,7 @@ ChainState App::captureMaster() const {
 void App::publishStemChain(int s, const ChainState* st) {
     auto reg = makeBuiltinRegistry();
     auto chain = std::make_unique<ProcessorChain>();
-    std::unique_ptr<IProcessor> ds, rs, tr, eq, comp, gate, dess;
+    std::unique_ptr<IProcessor> ds, rs, tr, eq, comp, gate, dess, eh;
     if (st) for (const auto& p : *st) {
         if (p.id == "hc.artifact") ds = restoreProc(reg, p);
         else if (p.id == "hc.resonance") rs = restoreProc(reg, p);
@@ -797,6 +804,7 @@ void App::publishStemChain(int s, const ChainState* st) {
         else if (p.id == "hc.comp") comp = restoreProc(reg, p);
         else if (p.id == "hc.gate") gate = restoreProc(reg, p);
         else if (p.id == "hc.deess") dess = restoreProc(reg, p);
+        else if (p.id == "hc.everyhit") eh = restoreProc(reg, p);
     }
     if (!ds) ds = reg.create("hc.artifact");
     if (!rs) rs = reg.create("hc.resonance");
@@ -806,6 +814,7 @@ void App::publishStemChain(int s, const ChainState* st) {
     if (!comp) { comp = reg.create("hc.comp"); comp->setBypassed(true); }
     if (!gate) { gate = reg.create("hc.gate"); gate->setBypassed(true); }
     if (!dess) { dess = reg.create("hc.deess"); dess->setBypassed(true); }
+    if (!eh) { eh = reg.create("hc.everyhit"); eh->setBypassed(true); }
     Slot& sl = slots_[static_cast<std::size_t>(s)];
     sl.ds = static_cast<ArtifactProcessor*>(ds.get());
     sl.rs = static_cast<ResonanceProcessor*>(rs.get());
@@ -814,8 +823,9 @@ void App::publishStemChain(int s, const ChainState* st) {
     sl.comp = static_cast<CompProcessor*>(comp.get());
     sl.gate = static_cast<GateProcessor*>(gate.get());
     sl.dess = static_cast<DeEsserProcessor*>(dess.get());
+    sl.eh = static_cast<EveryHitProcessor*>(eh.get());
     chain->add(std::move(gate)); chain->add(std::move(ds)); chain->add(std::move(rs)); chain->add(std::move(eq));
-    chain->add(std::move(dess)); chain->add(std::move(comp)); chain->add(std::move(tr));
+    chain->add(std::move(dess)); chain->add(std::move(eh)); chain->add(std::move(comp)); chain->add(std::move(tr));
     eng_->publishChain(static_cast<std::size_t>(s), std::move(chain));
     if (s == selected_) specFor_ = -1;
 }
@@ -2637,6 +2647,66 @@ void App::drawDeEssPanel(float ox, float oy) {
     gfx_.textIn({ox + 24, oy + 372, ox + 695, oy + 397}, "Red on the meter = what gets cut. Hats / tambourine 7-10 kHz, vocal \"sss\" 5-8 kHz.", Font::Small, kDim);
 }
 
+// EVERY HIT: every hit in the highs (tambourine, hats, "sss") is pulled down by AMOUNT, loud or quiet.
+// Built on HEM's EveryHitProcessor (include/hc/engine/every_hit.hpp). Between hits the audio is untouched.
+void App::drawEveryHitPanel(float ox, float oy) {
+    EveryHitProcessor* e = sel().eh;
+    if (!e) return;
+    const auto si = static_cast<std::size_t>(selected_);
+    const bool on = panelFrame(950, ox, oy, "EVERY HIT", e);
+    const bool dim = !on;
+    AtomicParam& fr = e->param(EveryHitProcessor::kFreq);
+    AtomicParam& am = e->param(EveryHitProcessor::kAmount);
+    AtomicParam& se = e->param(EveryHitProcessor::kSens);
+    AtomicParam& rl = e->param(EveryHitProcessor::kRelease);
+    AtomicParam& li = e->param(EveryHitProcessor::kListen);
+    // Hit lamp + cut bar.
+    const double t = now();
+    const float flash = clampf(1.0f - static_cast<float>(t - ehHitT_[si]) / 0.25f, 0.0f, 1.0f);
+    gfx_.circle(ox + 48, oy + 105, 13, 0x05080BFF);
+    gfx_.circle(ox + 48, oy + 105, 10, Color::lerp(0x3A1A10FF, 0xFF5A2AFF, flash));
+    gfx_.text(ox + 70, oy + 95, "HIT", Font::Small, flash > 0.1f ? Color(0xFFB08AFF) : kDim);
+    const Rect cb{ox + 120, oy + 92, ox + 500, oy + 118};
+    gfx_.rect(cb, 0x05080BFF);
+    gfx_.rectOutline(cb, Color(kOrange).alpha(0.3f), 1.2f);
+    const float cut = on ? ehCut_[si] : 0.0f;
+    if (cut > 0.05f) gfx_.gradientV({cb.x0 + 2, cb.y0 + 3, cb.x0 + 2 + clampf(cut / 24.0f, 0, 1) * (cb.w() - 4), cb.y1 - 3}, 0xFF7A3AFF, 0xC0401AFF);
+    gfx_.text(ox + 512, oy + 95, on ? fmt("cutting %.1f dB", cut) : std::string("(off)"), Font::Small, kOrange);
+    gfx_.text(ox + 120, oy + 124, fmt("hits caught: %.0f", static_cast<double>(ehHits_[si])), Font::Small, dim ? kDim : kText);
+
+    const float kr = 44, ky = oy + 240;
+    fr.set(panelKnob(951, ox + 100, ky, kr, fr.target(), 2000, 16000, Taper::Log, 7000, false, "FREQUENCY", fmt("%.1f kHz", fr.target() / 1000), dim, kOrange));
+    am.set(panelKnob(952, ox + 260, ky, kr, am.target(), 0, 24, Taper::Linear, 8, false, "AMOUNT", fmt("%.1f dB", am.target()), dim, kOrange));
+    se.set(panelKnob(953, ox + 420, ky, kr, se.target(), 3, 18, Taper::Linear, 9, false, "SENSITIVITY", fmt("%.1f dB", se.target()), dim, kOrange));
+    rl.set(panelKnob(954, ox + 580, ky, kr, rl.target(), 20, 500, Taper::Log, 80, false, "RELEASE", fmt("%.0f ms", rl.target()), dim, kOrange));
+
+    // FIND: frequency from the harsh hits the 3D scope heard in the last 8 s, then switch on.
+    const Rect fb{ox + 150, oy + 330, ox + 345, oy + 372};
+    if (button(955, fb)) {
+        const int n = spec_.hitsWithin(8.0);
+        if (!eng_->isPlaying() || n < 3) toast("Play the part with the tambourine / hats / 'sss', then click FIND");
+        else {
+            const float hz = spec_.hitHzWithin(8.0);
+            fr.set(clampf(hz / 1.41f, 2000.0f, 16000.0f));
+            e->setBypassed(false);
+            toast(fmt("EVERY HIT ON: %.0f hits", n) + fmt(" around %.1f kHz", hz / 1000.0) + fmt(" - FREQUENCY %.1f kHz. AMOUNT sets how much.", fr.target() / 1000.0));
+        }
+    }
+    gfx_.roundRect(fb, 8, Color(0x3A1E08F0));
+    gfx_.rectOutline(fb, Color(kOrange).alpha(hotId_ == 955 ? 0.95f : 0.6f), 1.5f);
+    gfx_.textIn(fb, "FIND", Font::Small, kText);
+    if (hotId_ == 955) { tooltip_ = "While it plays: sets FREQUENCY from the hits it hears and turns EVERY HIT on"; tipX_ = fb.cx(); tipY_ = fb.y0 - 4; tipSec_ = curSec_; }
+    const bool listen = li.target() > 0.5f;
+    const Rect lb{ox + 370, oy + 330, ox + 565, oy + 372};
+    if (button(956, lb)) li.set(listen ? 0.0f : 1.0f);
+    gfx_.roundRect(lb, 8, listen ? Color(kOrange).alpha(0.9f) : Color(0x05080BE0));
+    gfx_.rectOutline(lb, Color(kOrange).alpha(hotId_ == 956 ? 0.9f : 0.5f), 1.5f);
+    gfx_.textIn(lb, "LISTEN", Font::Small, listen ? Color(0x140800FF) : kText);
+    if (hotId_ == 956) { tooltip_ = "Hear only what's being cut (turn it back off when you're done)"; tipX_ = lb.cx(); tipY_ = lb.y0 - 4; tipSec_ = curSec_; }
+    gfx_.textIn({ox + 24, oy + 386, ox + 695, oy + 410}, "Every hit gets the same cut, loud or quiet. Between hits nothing changes.", Font::Small, kDim);
+    gfx_.textIn({ox + 24, oy + 410, ox + 695, oy + 434}, "Missing quiet hits? SENSITIVITY down. Catching too much? SENSITIVITY up.", Font::Small, kDim);
+}
+
 void App::pollDeEss() {
     const double t = now();
     const float dt = lastPoll_ > 0 ? static_cast<float>(std::min(0.25, t - lastPoll_)) : 0.0f;
@@ -2652,6 +2722,14 @@ void App::pollDeEss() {
         if (cut >= dessCut_[i]) { dessCut_[i] = cut; dessCutT_[i] = t; }
         else if (t - dessCutT_[i] > 0.8) dessCut_[i] = std::max(0.0f, dessCut_[i] - 24.0f * dt);
         if (static_cast<int>(i) == harshStem_ && t >= harshFrom_ && t < harshUntil_) harshMax_ = std::max(harshMax_, lv);
+        if (EveryHitProcessor* e = slots_[i].eh) {
+            const float c = e->takeCutPeakDb();
+            const std::uint32_t h = e->takeHitCount();
+            (void)e->takeLevelPeakDb();
+            if (h) { ehHits_[i] += h; ehHitT_[i] = t; }
+            if (c >= ehCut_[i]) { ehCut_[i] = c; ehCutT_[i] = t; }
+            else if (t - ehCutT_[i] > 0.6) ehCut_[i] = std::max(0.0f, ehCut_[i] - 24.0f * dt);
+        }
     }
 }
 
@@ -3031,7 +3109,7 @@ void App::drawScreen(int i) {
     const float ox = sc.src.x0, oy = sc.src.y0;
     switch (i) {
     case DK::kDestroyer: if (tab == 0) drawDestroyer(); else if (tab == 1) drawEqPanel(ox, oy); else drawScope3D(ox, oy); break;
-    case DK::kResonance: if (tab == 0) drawResonance(); else drawDeEssPanel(ox, oy); break;
+    case DK::kResonance: if (tab == 0) drawResonance(); else if (tab == 1) drawDeEssPanel(ox, oy); else drawEveryHitPanel(ox, oy); break;
     case DK::kTransient: if (tab == 0) drawTransient(); else if (tab == 1) drawCompPanel(ox, oy); else drawGatePanel(ox, oy); break;
     case DK::kMastering: drawMastering(); break;
     case DK::kConsole: drawTransport(); drawArrange(); break;
@@ -3042,10 +3120,10 @@ void App::drawScreen(int i) {
     if (i == DK::kDestroyer || i == DK::kResonance || i == DK::kTransient) {
         setSection(secs[i]);
         static const char* t0[] = {"DESTROYER", "EQ", "3D"};
-        static const char* t2[] = {"RESONANCE", "DE-ESSER"};
+        static const char* t2[] = {"RESONANCE", "DE-ESSER", "EVERY HIT"};
         static const char* t3[] = {"TRANSIENT", "COMP", "GATE"};
         if (i == DK::kDestroyer) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t0, 3);
-        else if (i == DK::kResonance) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t2, 2);
+        else if (i == DK::kResonance) drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t2, 3);
         else drawTabs(i, sc.src.x1 - 12, sc.src.y0 + 3, t3, 3);
         // (The stem picker sits in the top bar while this screen is open — see drawDeskChrome.)
     }
