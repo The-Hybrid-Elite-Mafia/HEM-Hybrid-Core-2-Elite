@@ -68,3 +68,9 @@ master lands on the target LUFS under the true-peak ceiling.
   rendering and playing 13 stems under Wine.
 - Not built yet: ASIO (it needs Steinberg's SDK; the faceplate art mentions ASIO, but playback is WASAPI).
 - Stems must all have the same sample rate (there's no resampler yet).
+
+## License
+
+GPLv3 (see `LICENSE`). The ASIO output uses Steinberg's ASIO SDK under its GPLv3 option; the SDK itself
+is not in this repository — the release build (`.github/workflows/release.yml`) downloads it. Local builds
+without it are Windows-audio (WASAPI) only.

@@ -1,0 +1,46 @@
+# Builds HYBRID CORE 2 ELITE (with ASIO) on a GitHub machine and publishes the installer as a
+# pre-release. Steinberg's ASIO SDK is downloaded here, used under its GPLv3 option (this project
+# is GPLv3, see LICENSE) and never committed or uploaded — only the built program is.
+name: release
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Tools (MinGW-w64, Python imaging)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq g++-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 python3-pil unzip > /dev/null
+
+      - name: Steinberg ASIO SDK (downloaded, not committed)
+        run: |
+          curl -fsSL -o asiosdk.zip https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip
+          sha256sum asiosdk.zip
+          mkdir -p external/asiosdk && unzip -q asiosdk.zip -d external/asiosdk
+          find external/asiosdk -maxdepth 3 -type d | head -20
+
+      - name: Build (app + installer)
+        run: ./build_windows.sh
+
+      - name: Engine tests (C++23)
+        run: |
+          g++ -std=c++23 -O2 -mavx2 -mfma -Iinclude tests/test_main.cpp -o hc_tests -lpthread
+          ./hc_tests | tee test_results.txt
+          echo "## Tests: $(grep -c '^\[PASS\]' test_results.txt) passed, $(grep -c '^\[FAIL\]' test_results.txt) failed" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish the installer (pre-release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="elite-build-${GITHUB_RUN_NUMBER}"
+          sha256sum dist/HybridCore2Elite-Setup.exe | tee dist/SHA256.txt
+          gh release create "$tag" dist/HybridCore2Elite-Setup.exe dist/SHA256.txt test_results.txt \
+            --prerelease --title "HYBRID CORE 2 ELITE - build ${GITHUB_RUN_NUMBER} (ASIO + WASAPI)" \
+            --notes "Built from ${GITHUB_SHA}. Includes ASIO (Steinberg ASIO SDK, GPLv3 option) and Windows audio. Test results attached."

@@ -40,7 +40,7 @@ if(WIN32)
   target_link_libraries(hc_play PRIVATE hybrid_core ole32 avrt)
 
   # THE HYBRID CORE Studio — the faceplate app.
-  add_executable(HybridCore2Elite WIN32 studio/main.cpp studio/gfx.cpp src/platform/wasapi_output.cpp studio/studio.rc)
+  add_executable(HybridCore2Elite WIN32 studio/main.cpp studio/gfx.cpp src/platform/wasapi_output.cpp src/platform/asio_output.cpp studio/studio.rc)
   target_include_directories(HybridCore2Elite PRIVATE studio)
   target_compile_definitions(HybridCore2Elite PRIVATE UNICODE _UNICODE)
   target_link_libraries(HybridCore2Elite PRIVATE hybrid_core d3d11 dxgi d3dcompiler windowscodecs ole32 uuid avrt comdlg32 shell32 gdi32 user32)

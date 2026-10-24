@@ -34,6 +34,7 @@
 #include "hc/engine/stem_engine.hpp"
 #include "hc/platform/thread_priority.hpp"
 #include "hc/platform/wasapi_output.hpp"
+#include "hc/platform/asio_output.hpp"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -316,7 +317,13 @@ private:
 
     std::unique_ptr<StemEngine> eng_;
     WasapiOutput dev_;
+    AsioOutput asio_;
     bool exclusive_ = false, audioRunning_ = false, nullAudio_ = false;
+    bool useAsio_ = false, asioOpen_ = false;   // useAsio_: the choice; asioOpen_: ASIO is what's running now
+    std::string asioDriver_;
+    std::vector<AsioDriverName> asioList_;
+    void loadAudioChoice();
+    void saveAudioChoice() const;
     std::thread nullThread_;
     std::atomic<bool> nullRun_{false};
     double sr_ = 48000.0;
@@ -414,6 +421,7 @@ bool App::init(HINSTANCE inst, int show) {
     gfx_.setBackdrop(rgba.data(), iw, ih);
 
     trHist_.assign(280, TransientViz{});
+    loadAudioChoice();
     rebuildEngine(48000.0);
     ShowWindow(hwnd_, show == SW_SHOWMINIMIZED || show == SW_MINIMIZE ? show : SW_SHOWMAXIMIZED);   // 16:9 faceplate: open maximized
     UpdateWindow(hwnd_);
@@ -486,6 +494,22 @@ void App::audioCallback(void* user, float* L, float* R, std::uint32_t n) noexcep
 
 void App::startAudio() {
     if (audioRunning_ || !eng_) return;
+    if (useAsio_ && !asioDriver_.empty()) {
+        AsioOutput::Config ac;
+        ac.driver = asioDriver_;
+        ac.sampleRate = sr_;
+        ac.maxBlock = kBlock;
+        ac.window = hwnd_;
+        std::string e = asio_.open(ac);
+        if (e.empty()) e = asio_.start(&App::audioCallback, eng_.get());
+        if (e.empty()) {
+            deviceDesc_ = asio_.info().description;
+            audioRunning_ = true; nullAudio_ = false; asioOpen_ = true;
+            return;
+        }
+        asio_.close();
+        toast(e + " - using Windows audio instead");
+    }
     WasapiOutput::Config cfg;
     cfg.mode = exclusive_ ? WasapiOutput::Mode::Exclusive : WasapiOutput::Mode::SharedLowLatency;
     cfg.sampleRate = sr_;
@@ -522,11 +546,31 @@ void App::startAudio() {
     audioRunning_ = true; nullAudio_ = true;
 }
 
+// The audio choice (Windows shared / exclusive / ASIO + driver) is kept in HKCU\Software\HEM\HybridCore2Elite,
+// so it survives restarts and upgrades.
+void App::loadAudioChoice() {
+    char buf[256] = {};
+    DWORD bytes = sizeof buf;
+    if (RegGetValueA(HKEY_CURRENT_USER, "Software\\HEM\\HybridCore2Elite", "Audio", RRF_RT_REG_SZ, nullptr, buf, &bytes) != ERROR_SUCCESS) return;
+    const std::string v = buf;
+    if (v == "exclusive") exclusive_ = true;
+    else if (v.rfind("asio:", 0) == 0 && v.size() > 5) { useAsio_ = true; asioDriver_ = v.substr(5); }
+}
+
+void App::saveAudioChoice() const {
+    const std::string v = useAsio_ ? "asio:" + asioDriver_ : (exclusive_ ? std::string("exclusive") : std::string("shared"));
+    HKEY k = nullptr;
+    if (RegCreateKeyExA(HKEY_CURRENT_USER, "Software\\HEM\\HybridCore2Elite", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+    RegSetValueExA(k, "Audio", 0, REG_SZ, reinterpret_cast<const BYTE*>(v.c_str()), static_cast<DWORD>(v.size() + 1));
+    RegCloseKey(k);
+}
+
 void App::stopAudio() {
     if (!audioRunning_) return;
     if (nullAudio_) { nullRun_ = false; if (nullThread_.joinable()) nullThread_.join(); }
+    else if (asioOpen_) asio_.close();
     else dev_.close();
-    audioRunning_ = false;
+    audioRunning_ = false; asioOpen_ = false;
 }
 
 StripState App::stripOf(int s) const {
@@ -918,7 +962,8 @@ void App::onExportDone() {
 // ====================================================================================== menus
 enum MenuId {
     ID_LOAD = 100, ID_LOAD_FOLDER = 99, ID_CLEAR_ALL = 101, ID_OPEN_SESSION, ID_SAVE_SESSION, ID_EXPORT, ID_EXIT,
-    ID_SHARED, ID_EXCLUSIVE, ID_RESET_METERS, ID_SLOT_LOAD, ID_SLOT_CLEAR, ID_SLOT_RESET, ID_VIEW_TOGGLE
+    ID_SHARED, ID_EXCLUSIVE, ID_RESET_METERS, ID_ASIO_FIRST = 7000, ID_ASIO_LAST = 7063,
+    ID_AFTER_ASIO = 7100, ID_SLOT_LOAD, ID_SLOT_CLEAR, ID_SLOT_RESET, ID_VIEW_TOGGLE
 };
 
 void App::showMainMenu() {
@@ -953,8 +998,15 @@ void App::showMainMenu() {
 
 void App::showSettingsMenu() {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING | (exclusive_ ? 0 : MF_CHECKED), ID_SHARED, L"Audio: Shared (plays with other apps)");
-    AppendMenuW(m, MF_STRING | (exclusive_ ? MF_CHECKED : 0), ID_EXCLUSIVE, L"Audio: Exclusive (lowest latency)");
+    AppendMenuW(m, MF_STRING | (!asioOpen_ && !exclusive_ ? MF_CHECKED : 0), ID_SHARED, L"Audio: Windows, Shared (plays with other apps)");
+    AppendMenuW(m, MF_STRING | (!asioOpen_ && exclusive_ ? MF_CHECKED : 0), ID_EXCLUSIVE, L"Audio: Windows, Exclusive (lower latency)");
+    asioList_ = listAsioDrivers();
+    if (!asioAvailable()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"ASIO: not in this build");
+    else if (asioList_.empty()) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"ASIO: no ASIO driver installed");
+    else
+        for (std::size_t i = 0; i < asioList_.size() && i <= ID_ASIO_LAST - ID_ASIO_FIRST; ++i)
+            AppendMenuW(m, MF_STRING | (asioOpen_ && asioList_[i].name == asioDriver_ ? MF_CHECKED : 0), ID_ASIO_FIRST + static_cast<UINT>(i),
+                        widen("Audio: ASIO - " + asioList_[i].name).c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, widen(deviceDesc_).c_str());
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, widen("Graphics: " + gfx_.adapterName()).c_str());
@@ -966,7 +1018,14 @@ void App::showSettingsMenu() {
     DestroyMenu(m);
     if (cmd == ID_SHARED || cmd == ID_EXCLUSIVE) {
         const bool want = cmd == ID_EXCLUSIVE;
-        if (want != exclusive_) { stopAudio(); exclusive_ = want; startAudio(); toast(deviceDesc_); }
+        if (want != exclusive_ || asioOpen_) { stopAudio(); useAsio_ = false; exclusive_ = want; startAudio(); toast(deviceDesc_); saveAudioChoice(); }
+    } else if (cmd >= ID_ASIO_FIRST && cmd <= ID_ASIO_LAST && static_cast<std::size_t>(cmd - ID_ASIO_FIRST) < asioList_.size()) {
+        stopAudio();
+        useAsio_ = true;
+        asioDriver_ = asioList_[static_cast<std::size_t>(cmd - ID_ASIO_FIRST)].name;
+        startAudio();
+        toast(deviceDesc_);
+        saveAudioChoice();
     } else if (cmd == ID_RESET_METERS && eng_) { eng_->requestMeterReset(); toast("Meters reset"); }
 }
 
