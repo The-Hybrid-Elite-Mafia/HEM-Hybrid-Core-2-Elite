@@ -5,6 +5,7 @@
 #include "hc/core/aligned_buffer.hpp"
 #include "hc/dsp/simd.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <iterator>
@@ -33,7 +34,7 @@ public:
     };
 
     void prepare(double sr) noexcept { sr_ = sr; setSettings(s_); reset(); }
-    void reset() noexcept { grDb_ = 0.0f; }
+    void reset() noexcept { grDb_ = 0.0f; grMeter_.store(0.0f, std::memory_order_relaxed); }
 
     void setSettings(const Settings& s) noexcept {
         s_ = s;
@@ -62,13 +63,16 @@ public:
             L[i] *= g;
             if (b.numChannels > 1) R[i] *= g;
         }
+        grMeter_.store(grDb_, std::memory_order_relaxed);   // for the UI (grDb_ itself is audio-thread only)
     }
-    float gainReductionDb() const noexcept { return grDb_; }
+    // Gain reduction at the end of the last block (dB, <= 0). Safe to call from the UI thread.
+    float gainReductionDb() const noexcept { return grMeter_.load(std::memory_order_relaxed); }
 
 private:
     Settings s_{};
     double sr_ = 48000.0;
     float att_ = 0, rel_ = 0, makeup_ = 1, grDb_ = 0;
+    std::atomic<float> grMeter_{0.0f};   // written by the audio thread once per block, read by the UI
 };
 
 // -----------------------------------------------------------------------------
@@ -177,20 +181,25 @@ public:
         tp_.reset(); dl_[0].zero(); dl_[1].zero(); boxRing_.zero();
         dlPos_ = 0; boxPos_ = 0; boxSum_ = static_cast<double>(L_); // ring starts full of 1.0
         for (std::uint32_t i = 0; i < L_; ++i) boxRing_[i] = 1.0f;
-        dqHead_ = dqTail_ = 0; n_ = 0; g_ = 1.0f; minGain_ = 1.0f;
+        dqHead_ = dqTail_ = 0; n_ = 0; g_ = 1.0f; minGain_.store(1.0f, std::memory_order_relaxed);
     }
     // 0.05 dB internal margin covers the residual between the detector's 4x
     // grid and the continuous-time peak (measured ~0.02 dB on hot noise).
     void setCeilingDb(float db) noexcept { ceiling_ = simd::db_to_gain(db - 0.05f); }
     void setRelease(float ms) noexcept { rel_ = static_cast<float>(std::exp(-1.0 / (sr_ * std::max(1.0f, ms) * 0.001))); }
     std::uint32_t latency() const noexcept { return delayN_ - 1; }
-    float gainReductionDb() const noexcept { return simd::gain_to_db(minGain_); }
-    void clearGrMeter() noexcept { minGain_ = 1.0f; }
+    // GR meter, safe from the UI thread. The audio thread keeps the deepest gain (lowest g) since the
+    // UI last took it. takeGainReductionDb() reads AND resets that hold in one atomic exchange, so a peak
+    // written between a separate "read" and "clear" can never be lost. Returns dB (<= 0).
+    float takeGainReductionDb() noexcept { return simd::gain_to_db(minGain_.exchange(1.0f, std::memory_order_relaxed)); }
+    // Peek without resetting (tests, tooltips).
+    float gainReductionDb() const noexcept { return simd::gain_to_db(minGain_.load(std::memory_order_relaxed)); }
 
     void process(AudioBlock& b) noexcept {
         float* L = b.ch[0];
         float* R = b.numChannels > 1 ? b.ch[1] : b.ch[0];
         const std::uint32_t cap = L_ + 1;
+        float blockMin = 1.0f;
         for (std::uint32_t i = 0; i < b.numFrames; ++i) {
             const float p = tp_.pushFrame(L[i], R[i]);
             const float req = p > ceiling_ ? ceiling_ / p : 1.0f;
@@ -211,7 +220,7 @@ public:
 
             // --- release (never above a) ---
             g_ = (a < g_) ? a : a + (g_ - a) * rel_;
-            minGain_ = std::min(minGain_, g_);
+            blockMin = std::min(blockMin, g_);
 
             // --- delay line ---
             const std::uint32_t rd = (dlPos_ + 1) % delayN_;        // oldest sample
@@ -222,6 +231,10 @@ public:
             if (b.numChannels > 1) R[i] = yr;
             ++n_;
         }
+        // Fold this block's deepest gain into the UI's hold. If the UI took (reset) the hold in between,
+        // the compare fails, `cur` becomes 1.0 and this block's value is stored — nothing is lost.
+        float cur = minGain_.load(std::memory_order_relaxed);
+        while (blockMin < cur && !minGain_.compare_exchange_weak(cur, blockMin, std::memory_order_relaxed)) {}
     }
 
 private:
@@ -230,7 +243,8 @@ private:
     std::uint32_t L_ = 2, delayN_ = 2, dlPos_ = 0, boxPos_ = 0, dqHead_ = 0, dqTail_ = 0;
     std::uint64_t n_ = 0;
     double boxSum_ = 0.0;
-    float ceiling_ = 0.891f, rel_ = 0.999f, g_ = 1.0f, minGain_ = 1.0f;
+    float ceiling_ = 0.891f, rel_ = 0.999f, g_ = 1.0f;
+    std::atomic<float> minGain_{1.0f};   // GR hold for the UI (see takeGainReductionDb)
     AlignedBuffer<float> dl_[2], boxRing_, dqVal_;
     AlignedBuffer<std::uint64_t> dqIdx_;
 };

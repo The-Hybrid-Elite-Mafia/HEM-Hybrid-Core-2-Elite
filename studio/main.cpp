@@ -30,6 +30,7 @@
 #include "desk_layout.hpp"
 #include "resource.h"
 #include "hc/app/offline_render.hpp"
+#include "hc/app/unsaved_changes.hpp"
 #include "hc/engine/builtin_processors.hpp"
 #include "hc/engine/stem_engine.hpp"
 #include "hc/platform/thread_priority.hpp"
@@ -388,8 +389,19 @@ private:
     void loadStemList(std::vector<std::wstring> files);
     void clearSlot(int s);
     void clearAll();
-    void saveSessionAs();
+    void newSession();            // menu "Clear All Stems": asks to save first, then starts an empty untitled session
+    bool saveSessionInPlace();    // Ctrl+S: to the session's own file, or Save As when it has none. true = written
+    bool saveSessionAs();         // Ctrl+Shift+S. true = written
     void openSession();
+    Session captureSession() const;   // everything a session file holds, as it is right now
+    // Unsaved changes: "*" in the title and "Save changes to <name>?" on close / New / Open.
+    UnsavedChanges unsaved_;
+    double lastDirtyCheck_ = 0;
+    std::wstring shownTitle_;
+    void markClean();     // after save / open / new
+    void checkDirty();    // compares the session as it is now with the last saved one
+    void updateTitle();
+    bool okToDiscard();   // true = go on (clean, saved, or "No"); false = Cancel or the save failed
     void exportMaster();
     void onExportDone();
     int loadedCount() const;
@@ -614,6 +626,7 @@ bool App::init(HINSTANCE inst, int show) {
     ShowWindow(hwnd_, show == SW_SHOWMINIMIZED || show == SW_MINIMIZE ? show : SW_SHOWMAXIMIZED);   // 16:9 faceplate: open maximized
     UpdateWindow(hwnd_);
     toast("Click any screen to work on it  -  drag your stems (or their folder) onto the window to load them");
+    markClean();
     return true;
 }
 
@@ -667,6 +680,7 @@ void App::openFromCommandLine() {
                 loopOn_ = sn.loopOn; loopA_ = sn.loopA; loopB_ = sn.loopB;
                 rebuildEngine(rate > 0 ? rate : sr_, &sn);
                 sessionPath_ = a;
+                markClean();
             }
         } else if (low.size() > 4 && low.substr(low.size() - 4) == L".wav") wavs.push_back(a);
     }
@@ -1018,8 +1032,13 @@ void App::loadFolder() {
 // Up to 13 WAVs replace what's loaded (dropped folders, picked folders).
 void App::loadStemList(std::vector<std::wstring> files) {
     if (files.empty()) { MessageBoxW(hwnd_, L"No WAV files there.\n\nIf the stems are still in a .zip, open the zip and click Extract all first.", L"Hybrid Core", MB_ICONINFORMATION); return; }
+    if (exporting_) { toast("Wait for the export to finish"); return; }
     if (files.size() > kNumStems) files.resize(kNumStems);
-    if (loadedCount()) clearAll();
+    if (loadedCount()) {   // replaces the song that's loaded: a new session
+        if (!okToDiscard()) return;
+        clearAll();
+        markClean();
+    }
     loadFiles(files);
 }
 
@@ -1047,7 +1066,14 @@ void App::clearAll() {
     eng_->seek(0);
 }
 
-void App::saveSessionAs() {
+void App::newSession() {
+    if (exporting_) { toast("Wait for the export to finish"); return; }
+    if (!okToDiscard()) return;
+    clearAll();
+    markClean();
+}
+
+Session App::captureSession() const {
     Session s;
     s.paths.resize(kNumStems); s.chains.resize(kNumStems); s.strips.resize(kNumStems);
     for (std::size_t i = 0; i < kNumStems; ++i) {
@@ -1058,17 +1084,57 @@ void App::saveSessionAs() {
     s.master = captureMaster();
     s.bpm = bpm_; s.targetLufs = target_; s.normalize = normalize_; s.glueMode = static_cast<int>(glueMode_); s.preset = preset_;
     s.loopOn = loopOn_; s.loopA = loopA_; s.loopB = loopB_;
+    return s;
+}
+
+bool App::saveSessionAs() {
+    const Session s = captureSession();
     const std::wstring def = widen(songTitle()) + L" - HEM Session";
     const std::wstring path = saveFileDialog(hwnd_, L"Save Hybrid Core Session", {L"Hybrid Core Session (*.hcs)", L"*.hcs"}, L"hcs",
                                              sessionPath_.empty() ? def : sessionPath_);
-    if (path.empty()) return;
-    if (auto e = saveSession(path, s); !e.empty()) { MessageBoxW(hwnd_, widen(e).c_str(), L"Hybrid Core", MB_ICONERROR); return; }
+    if (path.empty()) return false;
+    if (auto e = saveSession(path, s); !e.empty()) { MessageBoxW(hwnd_, widen(e).c_str(), L"Hybrid Core", MB_ICONERROR); return false; }
     sessionPath_ = path;
+    unsaved_.markClean(sessionText(s));
+    updateTitle();
     toast("Session saved");
+    return true;
+}
+
+bool App::saveSessionInPlace() {
+    if (sessionPath_.empty()) return saveSessionAs();
+    const Session s = captureSession();
+    if (auto e = saveSession(sessionPath_, s); !e.empty()) { MessageBoxW(hwnd_, widen(e).c_str(), L"Hybrid Core", MB_ICONERROR); return false; }
+    unsaved_.markClean(sessionText(s));
+    updateTitle();
+    toast("Session saved");
+    return true;
+}
+
+void App::markClean() { unsaved_.markClean(sessionText(captureSession())); updateTitle(); }
+void App::checkDirty() { lastDirtyCheck_ = now(); unsaved_.update(sessionText(captureSession())); updateTitle(); }
+
+void App::updateTitle() {
+    const std::wstring t = widen(sessionWindowTitle("HYBRID CORE 2 ELITE — Hybrid Elite Mafia", sessionDisplayName(narrow(sessionPath_)), unsaved_.dirty()));
+    if (t != shownTitle_ && hwnd_) { SetWindowTextW(hwnd_, t.c_str()); shownTitle_ = t; }
+}
+
+bool App::okToDiscard() {
+    checkDirty();
+    const std::string name = sessionDisplayName(narrow(sessionPath_));
+    return confirmDiscard(
+        unsaved_.dirty(),
+        [&] {
+            const int r = MessageBoxW(hwnd_, widen("Save changes to " + name + "?").c_str(), L"HYBRID CORE 2 ELITE",
+                                      MB_YESNOCANCEL | MB_ICONWARNING);
+            return r == IDYES ? SaveAnswer::Yes : (r == IDNO ? SaveAnswer::No : SaveAnswer::Cancel);
+        },
+        [this] { return saveSessionInPlace(); });
 }
 
 void App::openSession() {
     if (exporting_) { toast("Wait for the export to finish"); return; }
+    if (!okToDiscard()) return;
     auto files = openFilesDialog(hwnd_, L"Open Hybrid Core Session", {L"Hybrid Core Session (*.hcs)", L"*.hcs"}, false);
     if (files.empty()) return;
     Session s;
@@ -1092,6 +1158,7 @@ void App::openSession() {
     rebuildEngine(rate > 0 ? rate : sr_, &s);
     eng_->seek(0);
     sessionPath_ = files[0];
+    markClean();
     if (!missing.empty()) MessageBoxW(hwnd_, widen("These stems couldn't be opened:\n\n" + missing).c_str(), L"Hybrid Core", MB_ICONWARNING);
     toast("Session opened");
 }
@@ -1155,7 +1222,7 @@ void App::onExportDone() {
 enum MenuId {
     ID_LOAD = 100, ID_LOAD_FOLDER = 99, ID_CLEAR_ALL = 101, ID_OPEN_SESSION, ID_SAVE_SESSION, ID_EXPORT, ID_EXIT,
     ID_SHARED, ID_EXCLUSIVE, ID_RESET_METERS, ID_ASIO_FIRST = 7000, ID_ASIO_LAST = 7063,
-    ID_AFTER_ASIO = 7100, ID_SLOT_LOAD, ID_SLOT_CLEAR, ID_SLOT_RESET, ID_VIEW_TOGGLE
+    ID_AFTER_ASIO = 7100, ID_SLOT_LOAD, ID_SLOT_CLEAR, ID_SLOT_RESET, ID_VIEW_TOGGLE, ID_SAVE_SESSION_AS
 };
 
 void App::showMainMenu() {
@@ -1165,7 +1232,8 @@ void App::showMainMenu() {
     AppendMenuW(m, MF_STRING | (loadedCount() ? 0 : MF_GRAYED), ID_CLEAR_ALL, L"Clear All Stems");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_OPEN_SESSION, L"Open Session…\tCtrl+O");
-    AppendMenuW(m, MF_STRING, ID_SAVE_SESSION, L"Save Session…\tCtrl+S");
+    AppendMenuW(m, MF_STRING, ID_SAVE_SESSION, L"Save Session\tCtrl+S");
+    AppendMenuW(m, MF_STRING, ID_SAVE_SESSION_AS, L"Save Session As…\tCtrl+Shift+S");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (loadedCount() ? 0 : MF_GRAYED), ID_EXPORT, exporting_ ? L"Cancel Export" : L"Export Master…\tCtrl+E");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1178,9 +1246,10 @@ void App::showMainMenu() {
     switch (cmd) {
     case ID_LOAD_FOLDER: loadFolder(); break;
     case ID_LOAD: loadFiles(openFilesDialog(hwnd_, L"Load Stems (up to 13 WAV files)", {L"WAV audio (*.wav)", L"*.wav"}, true)); break;
-    case ID_CLEAR_ALL: clearAll(); break;
+    case ID_CLEAR_ALL: newSession(); break;
     case ID_OPEN_SESSION: openSession(); break;
-    case ID_SAVE_SESSION: saveSessionAs(); break;
+    case ID_SAVE_SESSION: saveSessionInPlace(); break;
+    case ID_SAVE_SESSION_AS: saveSessionAs(); break;
     case ID_EXPORT: exportMaster(); break;
     case ID_VIEW_TOGGLE: toggleFullscreen(); break;
     case ID_EXIT: PostMessageW(hwnd_, WM_CLOSE, 0, 0); break;
@@ -1225,7 +1294,7 @@ void App::showAbout() {
     const std::string s = std::string("THE HYBRID CORE ") + kVersion + "\nHybrid Elite Mafia Studio Suite\n\n"
         "Scratch-built C++20 audio engine · WASAPI · AVX2 · Direct3D 11\n\n"
         "Keys:\n  Space  play / stop\n  Home  back to start\n  Ctrl+L  load stems    Ctrl+E  export master\n"
-        "  Ctrl+O / Ctrl+S  open / save session\n\n"
+        "  Ctrl+O / Ctrl+S  open / save session    Ctrl+Shift+S  save as\n\n"
         "Knobs: drag up/down (Shift = fine), mouse wheel, double-click = default.\n"
         "Track name: click = select, drag left/right = volume, double-click = 0 dB, right-click = menu.\n"
         "Plugin titles: click to bypass.";
@@ -1506,6 +1575,7 @@ void App::frame() {
     eng_->masterSnapshot().update();
     master_ = eng_->masterSnapshot().read_buffer();
 
+    if (now() - lastDirtyCheck_ > 0.25) checkDirty();   // "*" in the title as soon as something changes
     feedSpectrum();
     pollDeEss();
     updateFindHarsh();
@@ -2125,8 +2195,7 @@ void App::drawMastering() {
     dr.set(-thr);
     re.set(knob(622, LY::msRelease, re.target(), 5, 1000, Taper::Log, 80, false, kCyan, fmt("Release %.0f ms", re.target()), by));
     wd.set(knob(623, LY::msWidth, wd.target(), 0, 200, Taper::Linear, 100, true, kCyan, fmt("Width %.0f %%", wd.target()), false));
-    const float gr = lim_->limiter().gainReductionDb();
-    lim_->limiter().clearGrMeter();
+    const float gr = lim_->limiter().takeGainReductionDb();   // deepest GR since the last frame; read + reset in one step
     if (gr < -0.1f) {   // limiter gain reduction, shown on the threshold knob's top edge
         const std::string g = fmt("GR %.1f dB", gr);
         const float w = gfx_.textWidth(g, Font::Small) + 10;
@@ -3283,7 +3352,7 @@ LRESULT App::wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         else if (ctrl && w == 'L' && !(GetKeyState(VK_SHIFT) & 0x8000)) loadFolder();
         else if (ctrl && w == 'L') loadFiles(openFilesDialog(hwnd_, L"Load Stems (up to 13 WAV files)", {L"WAV audio (*.wav)", L"*.wav"}, true));
         else if (ctrl && w == 'O') openSession();
-        else if (ctrl && w == 'S') saveSessionAs();
+        else if (ctrl && w == 'S') { if (GetKeyState(VK_SHIFT) & 0x8000) saveSessionAs(); else saveSessionInPlace(); }
         else if (ctrl && w == 'E') exportMaster();
         return 0;
     }
@@ -3316,6 +3385,7 @@ LRESULT App::wndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_EXPORT_DONE: onExportDone(); return 0;
     case WM_CLOSE:
+        if (!okToDiscard()) return 0;   // "Save changes to <name>?" Yes / No / Cancel
         if (exporting_ && MessageBoxW(h, L"An export is still running. Quit anyway?", L"Hybrid Core", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
         DestroyWindow(h);
         return 0;

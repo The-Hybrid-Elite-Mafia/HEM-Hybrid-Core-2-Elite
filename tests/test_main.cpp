@@ -10,6 +10,8 @@
 #include "hc/meter/spectrum.hpp"
 #include "hc/engine/builtin_processors.hpp"
 #include "hc/engine/stem_engine.hpp"
+#include "hc/app/unsaved_changes.hpp"
+#include <string>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -665,6 +667,102 @@ static void testWidth() {
     check(d < 1e-6, "Width 0 % → mono (max |L−R|)", d);
 }
 
+// ---------------------------------------------------------------------------- meters the UI reads (thread-safe)
+// Limiter GR meter: holds the deepest reduction since the UI last read it; the read resets it (one atomic
+// exchange, so nothing the audio thread writes in between is lost). No allocation while processing.
+static void testLimiterGrMeter() {
+    const double sr = 48000; const std::uint32_t blk = 256;
+    LimiterProcessor lim;   // ceiling -1 dBTP, drive 0
+    lim.prepare(sr, blk);
+    auto tone = [&](double amp, std::size_t n) {
+        std::vector<float> x(n);
+        for (std::size_t i = 0; i < n; ++i) x[i] = float(amp * std::sin(2 * kPi * 1000.0 * double(i) / sr));
+        return x;
+    };
+    // +6 dBFS burst (0.1 s), then 1 s of silence: the limiter has fully released, the meter still holds the burst.
+    std::vector<float> L = tone(2.0, 4800); L.resize(4800 + 48000, 0.0f);
+    std::vector<float> R = L;
+    long allocs = -1;
+    runStereo(lim, L, R, blk, &allocs);
+    const float held = lim.limiter().takeGainReductionDb();
+    const double expect = 20.0 * std::log10(std::pow(10.0, (-1.0 - 0.05) / 20.0) / 2.0);   // ceiling / peak
+    check(std::fabs(held - expect) < 0.3, "Limiter GR meter holds the +6 dB burst after 1 s of silence (dB)", held, "dB");
+    check(allocs == 0, "Limiter: no memory allocation while processing (with GR meter)", double(allocs));
+    check(lim.limiter().takeGainReductionDb() == 0.0f, "Limiter GR meter: reading it resets it (dB, 2nd read)", 0.0, "dB");
+    // One quiet block after the read: the meter shows the present (≈ 0 dB), not the old burst.
+    std::vector<float> q(blk, 0.0f), q2(blk, 0.0f);
+    runStereo(lim, q, q2, blk, nullptr);
+    const float quiet = lim.limiter().takeGainReductionDb();
+    check(quiet > -0.01f, "Limiter GR meter: quiet block after a read shows no reduction (dB)", quiet, "dB");
+    // A smaller burst (0 dBFS) now reads its own, smaller reduction: the old -7 dB hold was really cleared.
+    std::vector<float> L2 = tone(1.0, 4800), R2 = L2;
+    runStereo(lim, L2, R2, blk, nullptr);
+    const float small = lim.limiter().takeGainReductionDb();
+    check(small < -0.8f && small > -1.4f, "Limiter GR meter: 0 dBFS burst after reset reads about -1 dB", small, "dB");
+}
+
+// Compressor GR and the TRANSIENT activity light, as the UI reads them.
+static void testUiMeters() {
+    const double sr = 48000;
+    CompProcessor c;
+    c.param(CompProcessor::kThresh).set(-30); c.param(CompProcessor::kRatio).set(4); c.param(CompProcessor::kKnee).set(0);
+    c.prepare(sr, 256);
+    std::vector<float> L(24000), R;
+    for (std::size_t i = 0; i < L.size(); ++i) L[i] = float(0.5 * std::sin(2 * kPi * 440.0 * double(i) / sr));
+    R = L;
+    long allocs = -1;
+    runStereo(c, L, R, 256, &allocs);
+    // peak -6 dBFS, threshold -30, 4:1 → about -18 dB of reduction
+    check(c.meterValue() < -15.0f && c.meterValue() > -19.0f, "Comp GR meter (UI read) on -6 dBFS peaks, -30 dB / 4:1", c.meterValue(), "dB");
+    check(allocs == 0, "Comp: no memory allocation while processing (with GR meter)", double(allocs));
+
+    // Block size 256 (a multiple of the 128-sample display chunk): the light used to stay dark here.
+    TransientProcessor tp; tp.param(TransientProcessor::kAttack).set(12);
+    tp.prepare(sr, 256);
+    std::vector<float> h(256 * 4, 0.0f);
+    for (std::size_t i = 0; i < h.size(); ++i) h[i] = float(0.3 * std::exp(-double(i) / sr * 6) * std::sin(2 * kPi * 200 * double(i) / sr));
+    std::vector<float> h2 = h;
+    AudioBlock b{{h.data(), h2.data()}, 2, 256};
+    tp.process(b);
+    check(tp.active(), "TRANSIENT light on during a hit (ATTACK +12, 256-sample blocks)", tp.active() ? 1.0 : 0.0);
+    std::vector<float> z(96000, 0.0f), z2(96000, 0.0f);
+    runStereo(tp, z, z2, 256, nullptr);
+    check(!tp.active(), "TRANSIENT light off after 2 s of silence", tp.active() ? 1.0 : 0.0);
+}
+
+// "Save changes?" logic (hc/app/unsaved_changes.hpp) — the window code calls exactly these.
+static void testUnsavedChanges() {
+    const std::string saved = "HYBRIDCORE_SESSION 1\nbpm 120\nstrip 0 0 0 0 0\n";
+    UnsavedChanges u;
+    u.markClean(saved);
+    check(!u.dirty(), "Session: clean right after save / open / new", u.dirty());
+    u.update(saved);
+    check(!u.dirty(), "Session: nothing changed -> still clean", u.dirty());
+    u.update("HYBRIDCORE_SESSION 1\nbpm 120\nstrip 0 -3.5 0 0 0\n");
+    check(u.dirty(), "Session: a fader move -> dirty", u.dirty());
+    check(sessionWindowTitle("APP", sessionDisplayName("C:\\Songs\\My Song.hcs"), u.dirty()) == "*My Song.hcs - APP",
+          "Session: title shows * while dirty (\"*My Song.hcs - APP\")", 1.0);
+    u.update(saved);
+    check(!u.dirty(), "Session: fader moved back -> clean again", u.dirty());
+    check(sessionWindowTitle("APP", sessionDisplayName(""), false) == "Untitled - APP", "Session: untitled, clean title (\"Untitled - APP\")", 1.0);
+
+    int asked = 0, saves = 0;
+    auto run = [&](bool dirty, SaveAnswer a, bool saveWorks) {
+        asked = saves = 0;
+        return confirmDiscard(dirty, [&] { ++asked; return a; }, [&] { ++saves; return saveWorks; });
+    };
+    bool go = run(false, SaveAnswer::Cancel, false);
+    check(go && asked == 0, "Close/New/Open when clean: no question, goes on (questions)", asked);
+    go = run(true, SaveAnswer::Yes, true);
+    check(go && saves == 1, "Dirty + Yes: saves once, then goes on (saves)", saves);
+    go = run(true, SaveAnswer::Yes, false);
+    check(!go && saves == 1, "Dirty + Yes, save failed / Save As cancelled: stays (saves)", saves);
+    go = run(true, SaveAnswer::No, true);
+    check(go && saves == 0, "Dirty + No: goes on without saving (saves)", saves);
+    go = run(true, SaveAnswer::Cancel, true);
+    check(!go && saves == 0 && asked == 1, "Dirty + Cancel: stays, nothing saved (saves)", saves);
+}
+
 int main() {
     simd::ScopedFlushDenormals ftz;
     std::setvbuf(stdout, nullptr, _IONBF, 0);
@@ -674,7 +772,9 @@ int main() {
     testArtifactLatencyAndTransparency(); testArtifactShimmerReduction();
     testResonance(); testResonanceTransparent(); testTransient(); testWidth();
     testEngine();
-    testLoop(); testGate(); testDeEsser(); testEveryHit(); benchEngine();
+    testLoop(); testGate(); testDeEsser(); testEveryHit();
+    testLimiterGrMeter(); testUiMeters(); testUnsavedChanges();
+    benchEngine();
     std::printf("\n%s (%d failure%s)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
 }

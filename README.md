@@ -47,7 +47,7 @@ click or drag it to move the playhead. F11 = full screen.
 
 Loop: drag across the bar numbers to set the section (snaps to whole bars; Shift = free), click the bar numbers to jump; LOOP or **L** turns it on/off; with no section set it loops the whole song. The wrap is sample-exact inside the audio engine (no gap). Export always renders the whole song. Saved in the session.
 
-Keys: Space play/stop · Home rewind · L loop · Tab next screen · Esc / F9 back to the desk · Ctrl+L load · Ctrl+E export · Ctrl+O / Ctrl+S open/save session.
+Keys: Space play/stop · Home rewind · L loop · Tab next screen · Esc / F9 back to the desk · Ctrl+L load · Ctrl+E export · Ctrl+O / Ctrl+S open/save session · Ctrl+Shift+S save as. Unsaved changes show a * in the title bar; closing, Clear All Stems or Open Session asks "Save changes?" first.
 Knobs: drag up/down (Shift = fine), mouse wheel, double-click = default.
 
 Export writes a 24-bit WAV. With a target set, it renders three passes (measure → limit → verify) so the

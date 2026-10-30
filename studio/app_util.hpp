@@ -269,9 +269,9 @@ inline void writeChain(std::ostream& o, const char* tag, int slot, const ChainSt
     }
 }
 
-inline std::string saveSession(const std::wstring& file, const Session& s) {
-    std::ofstream o(std::filesystem::path(file), std::ios::binary);
-    if (!o) return "Can't write the session file.";
+// The session file's text. Also used as the "unsaved changes" fingerprint (see hc/app/unsaved_changes.hpp):
+// whatever is written here is exactly what counts as a change.
+inline void writeSession(std::ostream& o, const Session& s) {
     o << "HYBRIDCORE_SESSION 1\n";
     o << "bpm " << s.bpm << "\ntarget " << s.targetLufs << "\nnormalize " << (s.normalize ? 1 : 0)
       << "\nglue " << s.glueMode << "\npreset " << s.preset << '\n';
@@ -283,6 +283,19 @@ inline std::string saveSession(const std::wstring& file, const Session& s) {
         writeChain(o, "proc", static_cast<int>(i), s.chains[i]);
     }
     writeChain(o, "mproc", 0, s.master);
+}
+
+inline std::string sessionText(const Session& s) {
+    std::ostringstream o;
+    writeSession(o, s);
+    return o.str();
+}
+
+inline std::string saveSession(const std::wstring& file, const Session& s) {
+    std::ofstream o(std::filesystem::path(file), std::ios::binary);
+    if (!o) return "Can't write the session file.";
+    writeSession(o, s);
+    o.flush();
     return o ? std::string{} : "Write failed.";
 }
 

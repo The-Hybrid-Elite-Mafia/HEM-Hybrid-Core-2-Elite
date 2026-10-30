@@ -20,6 +20,7 @@
 #include "hc/core/lockfree.hpp"
 #include "hc/dsp/simd.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 
@@ -42,7 +43,10 @@ public:
         c25_ = c(25.0); c8_ = c(8.0);
         reset();
     }
-    void reset() noexcept { fast_ = slow_ = lng_ = shrt_ = 1e-6f; g_ = 1.0f; chunkN_ = 0; chunkPk_ = 0; chunkA_ = chunkS_ = 0; }
+    void reset() noexcept {
+        fast_ = slow_ = lng_ = shrt_ = 1e-6f; g_ = 1.0f; chunkN_ = 0; chunkPk_ = 0; chunkA_ = chunkS_ = 0;
+        lastAttack_.store(0.0f, std::memory_order_relaxed); lastSustain_.store(0.0f, std::memory_order_relaxed);
+    }
 
     // attackDb/sustainDb in −15..+15, speed: 0 PUNCH, 1 SPEED, mix 0..1, outDb.
     void process(AudioBlock& b, float attackDb, float sustainDb, int speed, float mix, float outDb,
@@ -51,6 +55,7 @@ public:
         const float out = simd::db_to_gain(outDb);
         float* L = b.ch[0];
         float* R = b.numChannels > 1 ? b.ch[1] : b.ch[0];
+        float blkA = 0.0f, blkS = 0.0f;   // biggest attack / sustain gain in this block (for the activity light)
         for (std::uint32_t i = 0; i < b.numFrames; ++i) {
             const float x = std::max(std::fabs(L[i]), std::fabs(R[i])) + 1e-9f;
             fast_ = x + (fast_ - x) * (x > fast_ ? aFast_ : rFast_);
@@ -70,14 +75,22 @@ public:
             chunkPk_ = std::max(chunkPk_, x);
             if (std::fabs(aDb) > std::fabs(chunkA_)) chunkA_ = aDb;
             if (std::fabs(sDb) > std::fabs(chunkS_)) chunkS_ = sDb;
+            if (std::fabs(aDb) > std::fabs(blkA)) blkA = aDb;
+            if (std::fabs(sDb) > std::fabs(blkS)) blkS = sDb;
             if (++chunkN_ == 128) {
                 if (viz) viz->push(TransientViz{chunkPk_, chunkA_, chunkS_});
                 chunkN_ = 0; chunkPk_ = 0; chunkA_ = chunkS_ = 0;
             }
         }
-        lastAttack_ = chunkA_; lastSustain_ = chunkS_;
+        // The UI reads these (activity light), so they are atomics. The whole block's peak is kept: the old
+        // code kept the display chunk's, which was always 0 when the block size is a multiple of 128.
+        lastAttack_.store(blkA, std::memory_order_relaxed);
+        lastSustain_.store(blkS, std::memory_order_relaxed);
     }
-    bool active() const noexcept { return std::fabs(lastAttack_) > 0.5f || std::fabs(lastSustain_) > 0.5f; }
+    // Safe from the UI thread.
+    bool active() const noexcept {
+        return std::fabs(lastAttack_.load(std::memory_order_relaxed)) > 0.5f || std::fabs(lastSustain_.load(std::memory_order_relaxed)) > 0.5f;
+    }
 
 private:
     float c(double ms) const { return static_cast<float>(std::exp(-1.0 / (sr_ * ms * 0.001))); }
@@ -85,7 +98,8 @@ private:
     float aFast_ = 0, rFast_ = 0, rSlow_ = 0, aSus_ = 0, rLong_ = 0, rShort_ = 0, smooth_ = 0, c25_ = 0, c8_ = 0;
     float fast_ = 0, slow_ = 0, lng_ = 0, shrt_ = 0, g_ = 1.0f;
     std::uint32_t chunkN_ = 0;
-    float chunkPk_ = 0, chunkA_ = 0, chunkS_ = 0, lastAttack_ = 0, lastSustain_ = 0;
+    float chunkPk_ = 0, chunkA_ = 0, chunkS_ = 0;
+    std::atomic<float> lastAttack_{0.0f}, lastSustain_{0.0f};   // audio thread writes once per block, UI reads
 };
 
 } // namespace hc
